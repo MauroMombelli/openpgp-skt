@@ -2,8 +2,8 @@
 
 CFLAGS += -D_GNU_SOURCE -g -O3
 
-CFLAGS += $(shell pkg-config --cflags libqrencode gnutls)
-LDFLAGS += $(shell pkg-config --libs libqrencode gnutls)
+CFLAGS += $(shell pkg-config --cflags libqrencode gnutls libuv)
+LDFLAGS += $(shell pkg-config --libs libqrencode gnutls libuv)
 
 CFLAGS += $(shell gpgme-config --cflags)
 LDFLAGS += $(shell gpgme-config --libs)

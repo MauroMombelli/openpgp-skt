@@ -1,3 +1,5 @@
+#include <assert.h>
+#include <stdarg.h>
 #include <ctype.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -15,6 +17,7 @@
 #include <stdbool.h>
 #include <unistd.h>
 #include <gpgme.h>
+#include <uv.h>
 
 const char * psk_id_hint = "openpgp-skt";
 const char schema[] = "OPENPGP+SKT";
@@ -27,14 +30,19 @@ const char priority[] = "NORMAL:-CTYPE-ALL"
   ":-3DES-CBC:-CAMELLIA-128-CBC:-CAMELLIA-256-CBC";
 
 #define PSK_BYTES 16
-#define LOG_LEVEL 4
+#define LOG_LEVEL 9
+
+struct session_status;
 
 int print_qrcode(FILE* f, const QRcode* qrcode);
 int print_address_name(struct sockaddr_storage *addr, char *paddr, size_t paddrsz, int *port);
+void session_status_connect(uv_stream_t* server, int status);
+
 
 struct session_status {
-  int listen_socket;
-  int accepted_socket;
+  uv_loop_t *loop;
+  uv_tcp_t listen_socket;
+  uv_tcp_t accepted_socket;
   gnutls_datum_t psk;
   char addrp[INET6_ADDRSTRLEN];
   int port;
@@ -43,11 +51,15 @@ struct session_status {
   char pskhex[PSK_BYTES*2 + 1];
   struct sockaddr_storage sa_serv_storage;
   struct sockaddr_storage sa_cli_storage;
-  socklen_t sa_serv_storage_sz;
-  socklen_t sa_cli_storage_sz;
+  int sa_serv_storage_sz;
+  int sa_cli_storage_sz;
   gnutls_session_t session;
   gpgme_ctx_t gpgctx;
   struct ifaddrs *ifap;
+  char tlsreadbuf[65536];
+  size_t start;
+  size_t end;
+  bool handshake_done;
 };
 
 void session_status_free(struct session_status *status) {
@@ -64,13 +76,14 @@ void session_status_free(struct session_status *status) {
   }
 }
 
-struct session_status * session_status_new() {
+struct session_status * session_status_new(uv_loop_t *loop) {
   struct session_status *status = calloc(1, sizeof(struct session_status));
   size_t pskhexsz = sizeof(status->pskhex);
   gpgme_error_t gerr = GPG_ERR_NO_ERROR;
   int rc;
   
   if (status) {
+    status->loop = loop;
     status->sa_serv_storage_sz = sizeof (status->sa_serv_storage);
     status->sa_cli_storage_sz = sizeof (status->sa_cli_storage);
 
@@ -106,7 +119,7 @@ int session_status_choose_address(struct session_status* status) {
   struct sockaddr *myaddr = NULL;
   int myfamily = 0;
   int rc;
-  int optval = 1;
+  /*  int optval = 1; */
   
   /* pick an IP address with getifaddrs instead of using in6addr_any */
   if (getifaddrs(&status->ifap)) {
@@ -162,21 +175,22 @@ int session_status_choose_address(struct session_status* status) {
   }
   
   /* open listening socket */
-  status->listen_socket = socket(myfamily, SOCK_STREAM, 0);
-  if (status->listen_socket == -1) {
-    fprintf(stderr, "failed to allocate a socket of type %d: (%d) %s\n", myfamily, errno, strerror(errno));
+  if ((rc = uv_tcp_init(status->loop, &status->listen_socket))) {
+    fprintf(stderr, "failed to allocate a socket: (%d) %s\n", rc, uv_strerror(rc));
     return -1;
   }
+  /* FIXME: i don't know how to set SO_REUSEADDR for libuv.  maybe we don't need it, though.
   if ((rc = setsockopt(status->listen_socket, SOL_SOCKET, SO_REUSEADDR, (void *) &optval, sizeof(int)))) {
     fprintf(stderr, "failed to set SO_REUSEADDR: (%d) %s\n", errno, strerror(errno));
     return -1;
   }
-  if ((rc = bind(status->listen_socket, myaddr, myfamily == AF_INET ? sizeof(struct sockaddr_in) : sizeof(struct sockaddr_in6)))) {
-    fprintf(stderr, "failed to bind: (%d) %s\n", errno, strerror(errno));
+  */
+  if ((rc = uv_tcp_bind(&status->listen_socket, myaddr, 0))) {
+    fprintf(stderr, "failed to bind: (%d) %s\n", rc, uv_strerror(rc));
     return -1;
   }    
-  if ((rc = getsockname(status->listen_socket, (struct sockaddr *) &status->sa_serv_storage, &status->sa_serv_storage_sz))) {
-    fprintf(stderr, "failed to getsockname: (%d) %s\n", errno, strerror(errno));
+  if ((rc = uv_tcp_getsockname(&status->listen_socket, (struct sockaddr *) &status->sa_serv_storage, &status->sa_serv_storage_sz))) {
+    fprintf(stderr, "failed to uv_tcp_getsockname: (%d) %s\n", rc, uv_strerror(rc));
     return -1;
   }
   if (status->sa_serv_storage_sz > sizeof(status->sa_serv_storage)) {
@@ -189,7 +203,8 @@ int session_status_choose_address(struct session_status* status) {
   }
   if (print_address_name(&status->sa_serv_storage, status->addrp, sizeof(status->addrp), &status->port))
     return -1;
-  if ((rc = listen(status->listen_socket, 0))) {
+  status->listen_socket.data = status;
+  if ((rc = uv_listen((uv_stream_t*)(&status->listen_socket), 0, session_status_connect))) {
     fprintf(stderr, "failed to listen: (%d) %s\n", errno, strerror(errno));
     return -1;
   }
@@ -312,10 +327,200 @@ int print_address_name(struct sockaddr_storage *addr, char *paddr, size_t paddrs
   return 0;
 }
 
+void its_all_over(struct session_status *status, const char *fmt, ...) {
+  va_list ap;
+  int rc;
+  va_start(ap, fmt);
+  vfprintf(stderr, fmt, ap);
+  va_end(ap);
+  /* FIXME: how to tear it all down? */
+  if (status->session) {
+    if ((rc = gnutls_bye(status->session, GNUTLS_SHUT_RDWR))) {
+      fprintf(stderr, "gnutls_bye got error (%d) %s\n", rc, gnutls_strerror(rc));
+    }
+  }
+  uv_stop(status->loop);
+}
+
+/* FIXME: this would only be used in the event of a fully asynchronous
+   write.  however, i don't see how to keep track of the memory being
+   written correctly in that case.
+
+void session_status_write_done(uv_write_t* req, int x) {
+  if (x) {
+    fprintf(stderr, "write failed: (%d) %s\n", x, uv_strerror(x));
+    return;
+  }
+  struct session_status *status = req->handle->data;
+  
+  free(req);
+}
+*/
+
+ssize_t session_status_gnutls_push_func(gnutls_transport_ptr_t ptr, const void* buf, size_t sz) {
+  struct session_status *status = ptr;
+  int rc;
+  /* FIXME: be more asynchronous in writes; here we're just trying to be synchronous */
+  
+  /* FIXME: i do not like casting away constness here */
+  uv_buf_t b[] = {{ .base = (void*) buf, .len = sz }}; 
+
+  rc = uv_try_write((uv_stream_t*)(&status->accepted_socket), b, sizeof(b)/sizeof(b[0]));
+  if (rc >= 0)
+    return rc;
+  fprintf(stderr, "got error %d (%s) when trying to write %zd octets\n", rc, uv_strerror(rc), sz);
+  if (rc == UV_EAGAIN) {
+    gnutls_transport_set_errno(status->session, EAGAIN);
+    return -1;
+  }
+  gnutls_transport_set_errno(status->session, EIO);
+  return -1;
+}
+
+ssize_t session_status_gnutls_pull_func(gnutls_transport_ptr_t ptr, void* buf, size_t sz) {
+  struct session_status *status = ptr;
+  int available = status->end - status->start;
+  if (uv_is_closing((uv_handle_t*)(&status->accepted_socket)))
+    return 0;
+  if (status->end == status->start) {
+    gnutls_transport_set_errno(status->session, EAGAIN);
+    return -1;
+  }
+  /* FIXME: this seems like an extra unnecessary copy.  can we arrange
+     it so that the buffer gets passed through to the uv_alloc_cb? */
+  if (sz >= status->end - status->start) {
+    memcpy(buf, status->tlsreadbuf + status->start, available);
+    status->start = status->end = 0;
+    return available;
+  } else {
+    memcpy(buf, status->tlsreadbuf + status->start, sz);
+    status->start += sz;
+    return sz;
+  }
+}
+
+void session_status_alloc_cb(uv_handle_t* handle, size_t suggested_size, uv_buf_t* buf) {
+  struct session_status *status = handle->data;
+  assert(handle == (uv_handle_t*)(&status->accepted_socket));
+  buf->base = status->tlsreadbuf + status->end;
+  buf->len = sizeof(status->tlsreadbuf) - status->end;
+  /* FIXME: should consider how to read partial buffers, if these don't match a TLS record */
+}
+
+void session_status_handshake_done(struct session_status *status) {
+  char *desc;
+  desc = gnutls_session_get_desc(status->session);
+  fprintf(stdout, "TLS handshake complete: %s\n", desc);
+  gnutls_free(desc);
+  status->handshake_done = true;
+}
+
+void session_status_read_cb(uv_stream_t* stream, ssize_t nread, const uv_buf_t* buf) {
+  struct session_status *status = stream->data;
+  int rc;
+  assert(stream == (uv_stream_t*)(&status->accepted_socket));
+  assert(buf->base == status->tlsreadbuf + status->end);
+  status->end += nread;
+
+  if (!status->handshake_done) {
+    gnutls_alert_description_t alert;
+    rc = gnutls_handshake(status->session);
+    switch(rc) {
+    case GNUTLS_E_WARNING_ALERT_RECEIVED:
+      alert = gnutls_alert_get(status->session);
+      fprintf(stderr, "Got GnuTLS alert (%d) %s\n", alert, gnutls_alert_get_name(alert));
+      break;
+    case GNUTLS_E_INTERRUPTED:
+    case GNUTLS_E_AGAIN:
+      fprintf(stderr, "gnutls_handshake() got (%d) %s\n", rc, gnutls_strerror(rc));
+      break;
+    case GNUTLS_E_SUCCESS:
+      session_status_handshake_done(status);
+      break;
+    default:
+      its_all_over(status, "gnutls_handshake() got (%d) %s, fatal\n", rc, gnutls_strerror(rc));
+    }
+  } else {
+    gnutls_packet_t packet = NULL;
+    /* FIXME: we should fail if we've already decided that we're in active mode */
+    rc = gnutls_record_recv_packet(status->session, &packet);
+    if (rc == 0) {
+      /* FIXME: this is EOF */
+      assert(packet == NULL);
+      its_all_over(status, "done!\n");
+    } else if (rc < 0) {
+      if (packet)
+        gnutls_packet_deinit(packet);
+      if (rc == GNUTLS_E_INTERRUPTED || rc == GNUTLS_E_AGAIN) {
+        fprintf(stderr, "gnutls_record_recv_packet returned (%d) %s\n", rc, gnutls_strerror(rc));
+      } else {
+        /* this is an error */
+        its_all_over(status, "Got an error in gnutls_record_recv_packet: (%d) %s\n", rc, gnutls_strerror(rc));
+      }
+    } else {
+      /* we're now in passive mode.  */
+      /* FIXME: we should terminate the choice for active some number
+       of bytes was read */
+      gnutls_datum_t data;
+      size_t written = 0;
+      assert(packet);
+      gnutls_packet_get(packet, &data, NULL);
+      written = fwrite(data.data, data.size, 1, stdout);
+      
+      gnutls_packet_deinit(packet);
+      if (1 != written) {
+        its_all_over(status, "failed to write incoming record of size %d\n", data.size);
+      }
+    }
+  }
+}
+
+void session_status_cleanup_listener(uv_handle_t* handle) {
+  struct session_status *status = handle->data;
+  assert(handle == (uv_handle_t*)(&status->listen_socket));
+  /* FIXME: do we need to clean up anything? */
+}
+
+
+void session_status_connect(uv_stream_t* server, int x) {
+  int rc;
+  struct session_status *status = server->data;
+  assert(server == (uv_stream_t*)(&status->listen_socket));
+  if (x < 0) 
+    its_all_over(status, "connect callback called with status %d\n", x);
+  else if ((rc = uv_tcp_init(status->loop, &status->accepted_socket))) 
+    its_all_over(status, "failed to init accepted_socket: (%d) %s\n", rc, uv_strerror(rc));
+  else {
+    status->accepted_socket.data = status;
+    if ((rc = uv_accept(server, (uv_stream_t*)(&status->accepted_socket))))
+      its_all_over(status, "failed to init accepted_socket: (%d) %s\n", rc, uv_strerror(rc));
+    else if ((rc = uv_tcp_getpeername(&status->accepted_socket, (struct sockaddr*)(&status->sa_cli_storage),
+                                      &status->sa_cli_storage_sz)))
+      its_all_over(status, "failed to getpeername of connected host: (%d) %s\n", rc, uv_strerror(rc));
+    else {
+      uv_close((uv_handle_t*)(&status->listen_socket), session_status_cleanup_listener);
+      
+      if (print_address_name(&status->sa_cli_storage, status->caddrp, sizeof(status->caddrp), &status->cport))
+        return;
+      fprintf(stdout, "A connection was made from %s%s%s:%d!\n",
+              status->sa_cli_storage.ss_family==AF_INET6?"[":"",
+              status->caddrp,
+              status->sa_cli_storage.ss_family==AF_INET6?"]":"",
+              status->cport
+              );
+
+      if ((rc = uv_read_start((uv_stream_t*)(&status->accepted_socket), session_status_alloc_cb, session_status_read_cb)))
+        its_all_over(status, "failed to uv_read_start: (%d) %s\n", rc, uv_strerror(rc));
+    }
+  }
+}
+
+
 
 
 int main(int argc, const char *argv[]) {
   struct session_status *status;
+  uv_loop_t loop;
   int rc;
   gnutls_psk_server_credentials_t creds = NULL;
   gnutls_priority_t priority_cache;
@@ -327,6 +532,10 @@ int main(int argc, const char *argv[]) {
   gpgme_check_version (NULL);
   gnutls_global_set_log_level(LOG_LEVEL);
   gnutls_global_set_log_function(skt_log);
+  if ((rc = uv_loop_init(&loop))) {
+    fprintf(stderr, "failed to init uv_loop: (%d) %s\n", rc, uv_strerror(rc));
+    return -1;
+  }
 
   if (argc > 1) {
     if (!strcmp(argv[1], "-")) {
@@ -339,7 +548,7 @@ int main(int argc, const char *argv[]) {
     }
   }
 
-  status = session_status_new();
+  status = session_status_new(&loop);
   if (!status) {
     fprintf(stderr, "Failed to initialize status object\n");
     return -1;
@@ -348,11 +557,14 @@ int main(int argc, const char *argv[]) {
     return -1;
   
   /* open tls server connection */
-  if ((rc = gnutls_init(&status->session, GNUTLS_SERVER))) {
+  if ((rc = gnutls_init(&status->session, GNUTLS_SERVER | GNUTLS_NONBLOCK))) {
     fprintf(stderr, "failed to init session: (%d) %s\n", rc, gnutls_strerror(rc));
     return -1;
   }
   gnutls_session_set_ptr(status->session, status);
+  gnutls_transport_set_pull_function(status->session, session_status_gnutls_pull_func);
+  gnutls_transport_set_push_function(status->session, session_status_gnutls_push_func);
+  gnutls_transport_set_ptr(status->session, status);
   if ((rc = gnutls_psk_allocate_server_credentials(&creds))) {
     fprintf(stderr, "failed to allocate PSK credentials: (%d) %s\n", rc, gnutls_strerror(rc));
     return -1;
@@ -410,37 +622,13 @@ int main(int argc, const char *argv[]) {
   /* for test purposes... */
   fprintf(stdout, "gnutls-cli --debug %d --priority %s --port %d --pskusername %s --pskkey %s %s\n",
           LOG_LEVEL, priority, status->port, psk_id_hint, status->pskhex, status->addrp);
-  
-  /* wait for connection to come in */
-  /* FIXME: blocking */
-  status->accepted_socket = accept(status->listen_socket, (struct sockaddr *) &status->sa_cli_storage, &status->sa_cli_storage_sz);
-  if (close(status->listen_socket)) {
-    fprintf(stderr, "error closing listening socket: (%d) %s\n", errno, strerror(errno));
-    return -1;
+
+  if ((rc = uv_run(&loop, UV_RUN_DEFAULT))) {
+    while ((rc = uv_run(&loop, UV_RUN_ONCE))) {
+      fprintf(stderr, "UV_RUN_ONCE returned %d\n", rc);
+    }
   }
-
-  gnutls_transport_set_int(status->session, status->accepted_socket);
-
-  do {
-    rc = gnutls_handshake(status->session); /* FIXME: blocking */
-    if (rc && !gnutls_error_is_fatal(rc) && LOG_LEVEL > 2)
-      fprintf(stderr, "GnuTLS handshake returned: (%d) %s\n", rc, gnutls_strerror(rc));
-  } while (rc < 0 && gnutls_error_is_fatal(rc) == 0);
-
-  if (rc < 0) {
-    fprintf(stderr, "TLS Handshake failed (%d) %s\n", rc, gnutls_strerror(rc));
-    return -1;
-  }
-
-  if (print_address_name(&status->sa_cli_storage, status->caddrp, sizeof(status->caddrp), &status->cport))
-    return -1;
-
-  fprintf(stdout, "A connection was made from %s%s%s:%d!\n",
-          status->sa_cli_storage.ss_family==AF_INET6?"[":"",
-          status->caddrp,
-          status->sa_cli_storage.ss_family==AF_INET6?"]":"",
-          status->cport
-          );
+  fprintf(stderr, "Done with the loop\n");
 
   if (inkey) {
     /* FIXME: send key */
@@ -474,35 +662,6 @@ int main(int argc, const char *argv[]) {
         }
       }
     }
-  } else {
-    char data[65536];
-    ssize_t datasz;
-    /* receive key */
-    fprintf(stderr, "waiting to receive key\n");
-    /* it's cleaner to do this, but some clients do not like half-open connections: */
-    /* gnutls_bye(status->session, GNUTLS_SHUT_WR); */ 
-    
-    do {
-      datasz = gnutls_record_recv(status->session, data, sizeof(data)); /* FIXME: blocking */
-      if (datasz > 0) {
-        /* writing incoming key to stdout */
-        if (1 != fwrite(data, datasz, 1, stdout)) {
-          fprintf(stderr, "failed to write incoming record of size %zd\n", datasz);
-          return -1;
-        }
-        /* FIXME: do something more clever with the incoming key (feed
-           to gpgme ephemeral context and then prompt to import?) */
-      } else if (datasz < 0) {
-        fprintf(stderr, "got gnutls error on recv: (%zd) %s\n", datasz, gnutls_strerror(datasz));
-        switch (datasz) {
-        case GNUTLS_E_REHANDSHAKE:
-        case GNUTLS_E_PREMATURE_TERMINATION:
-          fprintf(stderr, "closing\n");
-          return -1;
-          break;;
-        }
-      }
-    } while (datasz);
   }
 
   /* cleanup */
