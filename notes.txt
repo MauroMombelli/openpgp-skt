@@ -5,12 +5,6 @@ https://pad.stratum0.org/p/openpgp-skt
 
 TODO:
 
- * convert program to event-driven model so that network activity and
-   user interaction from the console can both happen at the same time.
-
  * integrate with gpgme (both output and input)
 
  * allow selection of IP address (and network interface)
-
- * ensure that we only offer strong, known groups for DHE_PSK
-

@@ -36,6 +36,7 @@ struct session_status;
 
 int print_qrcode(FILE* f, const QRcode* qrcode);
 int print_address_name(struct sockaddr_storage *addr, char *paddr, size_t paddrsz, int *port);
+void its_all_over(struct session_status *status, const char *fmt, ...);
 void session_status_connect(uv_stream_t* server, int status);
 
 
@@ -60,6 +61,7 @@ struct session_status {
   size_t start;
   size_t end;
   bool handshake_done;
+  uv_tty_t input;
 };
 
 void session_status_free(struct session_status *status) {
@@ -74,6 +76,37 @@ void session_status_free(struct session_status *status) {
       freeifaddrs(status->ifap);
     free(status);
   }
+}
+
+
+void input_alloc_cb(uv_handle_t* handle, size_t suggested_size, uv_buf_t* buf) {
+  /*  struct session_status *status = handle->data; */
+  buf->base = malloc(1);
+  buf->len = buf->base ? 1 : 0;
+}
+
+void input_read_cb(uv_stream_t* stream, ssize_t nread, const uv_buf_t* buf) {
+  struct session_status *status = stream->data;
+  if (nread > 0) {
+    if (buf->base[0] == 3) {
+      its_all_over(status, "got ctrl-c\n");
+    } else if (buf->base[0] == 4) {
+      its_all_over(status, "got ctrl-d\n");
+    } else {
+      fprintf(stderr, "Got %d (0x%02x) '%.1s'\n", buf->base[0], buf->base[0], isprint(buf->base[0])? buf->base : "_");
+    }
+  } else if (nread < 0) {
+    its_all_over(status, "Got error during input_read_cb: (%d) %s\n", nread, uv_strerror(nread));
+  }
+  if (buf && buf->base)
+    free(buf->base);
+}
+
+void input_close_cb(uv_handle_t *handle) {
+  struct session_status *status = handle->data;
+  int rc;
+  if ((rc = uv_tty_set_mode(&status->input, UV_TTY_MODE_NORMAL)))
+    fprintf(stderr, "failed to switch input back to normal mode: (%d) %s\n", rc, uv_strerror(rc));
 }
 
 struct session_status * session_status_new(uv_loop_t *loop) {
@@ -107,8 +140,17 @@ struct session_status * session_status_new(uv_loop_t *loop) {
     }
     for (int ix = 0; ix < sizeof(status->pskhex)-1; ix++)
       status->pskhex[ix] = toupper(status->pskhex[ix]);
+    if ((rc = uv_tty_init(status->loop, &status->input, 0, 1))) {
+      fprintf(stderr, "failed to grab stdin for reading: (%d) %s\n", rc, uv_strerror(rc));
+      goto fail;
+    }
+    status->input.data = status;
+    if ((rc = uv_tty_set_mode(&status->input, UV_TTY_MODE_RAW))) {
+      fprintf(stderr, "failed to switch input to raw mode: (%d) %s\n", rc, uv_strerror(rc));
+      goto fail;
+    }
   }
-  return status;
+ return status;
  fail:
   session_status_free(status);
   return NULL;
@@ -339,6 +381,11 @@ void its_all_over(struct session_status *status, const char *fmt, ...) {
       fprintf(stderr, "gnutls_bye got error (%d) %s\n", rc, gnutls_strerror(rc));
     }
   }
+  if (!uv_is_closing((uv_handle_t*)(&status->input))) {
+    if ((rc = uv_tty_reset_mode()))
+      fprintf(stderr, "failed to uv_tty_reset_mode: (%d) %s\n", rc, uv_strerror(rc));
+    uv_close((uv_handle_t*)(&status->input), input_close_cb);
+  }
   uv_stop(status->loop);
 }
 
@@ -409,10 +456,16 @@ void session_status_alloc_cb(uv_handle_t* handle, size_t suggested_size, uv_buf_
 
 void session_status_handshake_done(struct session_status *status) {
   char *desc;
+  int rc;
   desc = gnutls_session_get_desc(status->session);
   fprintf(stdout, "TLS handshake complete: %s\n", desc);
   gnutls_free(desc);
   status->handshake_done = true;
+  /* FIXME: should flush all input before starting to respond to it */
+  if ((rc = uv_read_start((uv_stream_t*)(&status->input), input_alloc_cb, input_read_cb))) {
+    fprintf(stderr, "failed to start reading from stdin,we can only operate as the passive party: (%d) %s\n", rc, uv_strerror(rc));
+  }      
+
 }
 
 void session_status_read_cb(uv_stream_t* stream, ssize_t nread, const uv_buf_t* buf) {
