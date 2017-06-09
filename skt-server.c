@@ -124,7 +124,11 @@ struct session_status * session_status_new(uv_loop_t *loop) {
       fprintf(stderr, "gpgme_new failed: (%d), %s\n", gerr, gpgme_strerror(gerr));
       goto fail;
     }
-
+    if ((gerr = gpgme_ctx_set_engine_info(status->gpgctx, GPGME_PROTOCOL_OpenPGP, NULL, NULL))) {
+      fprintf(stderr, "gpgme_ctx_set_engine_info failed: (%d), %s\n", gerr, gpgme_strerror(gerr));
+      goto fail;
+    }
+         
     /* choose random number */  
     if ((rc = gnutls_key_generate(&status->psk, PSK_BYTES))) {
       fprintf(stderr, "failed to get randomness: (%d) %s\n", rc, gnutls_strerror(rc));
@@ -140,15 +144,6 @@ struct session_status * session_status_new(uv_loop_t *loop) {
     }
     for (int ix = 0; ix < sizeof(status->pskhex)-1; ix++)
       status->pskhex[ix] = toupper(status->pskhex[ix]);
-    if ((rc = uv_tty_init(status->loop, &status->input, 0, 1))) {
-      fprintf(stderr, "failed to grab stdin for reading: (%d) %s\n", rc, uv_strerror(rc));
-      goto fail;
-    }
-    status->input.data = status;
-    if ((rc = uv_tty_set_mode(&status->input, UV_TTY_MODE_RAW))) {
-      fprintf(stderr, "failed to switch input to raw mode: (%d) %s\n", rc, uv_strerror(rc));
-      goto fail;
-    }
   }
  return status;
  fail:
@@ -381,7 +376,7 @@ void its_all_over(struct session_status *status, const char *fmt, ...) {
       fprintf(stderr, "gnutls_bye got error (%d) %s\n", rc, gnutls_strerror(rc));
     }
   }
-  if (!uv_is_closing((uv_handle_t*)(&status->input))) {
+  if (status->input.data && !uv_is_closing((uv_handle_t*)(&status->input))) {
     if ((rc = uv_tty_reset_mode()))
       fprintf(stderr, "failed to uv_tty_reset_mode: (%d) %s\n", rc, uv_strerror(rc));
     uv_close((uv_handle_t*)(&status->input), input_close_cb);
@@ -462,10 +457,17 @@ void session_status_handshake_done(struct session_status *status) {
   gnutls_free(desc);
   status->handshake_done = true;
   /* FIXME: should flush all input before starting to respond to it */
-  if ((rc = uv_read_start((uv_stream_t*)(&status->input), input_alloc_cb, input_read_cb))) {
-    fprintf(stderr, "failed to start reading from stdin,we can only operate as the passive party: (%d) %s\n", rc, uv_strerror(rc));
-  }      
-
+  if ((rc = uv_tty_init(status->loop, &status->input, 0, 1))) {
+    fprintf(stderr, "failed to grab stdin for reading, using passive mode only: (%d) %s\n", rc, uv_strerror(rc));
+  } else if ((rc = uv_tty_set_mode(&status->input, UV_TTY_MODE_RAW))) {
+    fprintf(stderr, "failed to switch input to raw mode, using passive mode only: (%d) %s\n", rc, uv_strerror(rc));
+    uv_close((uv_handle_t*)(&status->input), input_close_cb);
+  } else if ((rc = uv_read_start((uv_stream_t*)(&status->input), input_alloc_cb, input_read_cb))) {
+    fprintf(stderr, "failed to start reading from stdin, using passive mode only: (%d) %s\n", rc, uv_strerror(rc));
+    uv_close((uv_handle_t*)(&status->input), input_close_cb);
+  } else {
+    status->input.data = status;
+  }
 }
 
 void session_status_read_cb(uv_stream_t* stream, ssize_t nread, const uv_buf_t* buf) {
