@@ -29,6 +29,9 @@ const char priority[] = "NORMAL:-CTYPE-ALL"
 #define PSK_BYTES 16
 #define LOG_LEVEL 4
 
+int print_qrcode(FILE* f, const QRcode* qrcode);
+int print_address_name(struct sockaddr_storage *addr, char *paddr, size_t paddrsz, int *port);
+
 struct session_status {
   int listen_socket;
   int accepted_socket;
@@ -47,16 +50,6 @@ struct session_status {
   struct ifaddrs *ifap;
 };
 
-
-struct session_status * session_status_new() {
-  struct session_status *status = calloc(1, sizeof(struct session_status));
-  if (status) {
-    status->sa_serv_storage_sz = sizeof (status->sa_serv_storage);
-    status->sa_cli_storage_sz = sizeof (status->sa_cli_storage);
-  }
-  return status;
-}
-
 void session_status_free(struct session_status *status) {
   if (status) {
     if (status->gpgctx)
@@ -71,8 +64,137 @@ void session_status_free(struct session_status *status) {
   }
 }
 
+struct session_status * session_status_new() {
+  struct session_status *status = calloc(1, sizeof(struct session_status));
+  size_t pskhexsz = sizeof(status->pskhex);
+  gpgme_error_t gerr = GPG_ERR_NO_ERROR;
+  int rc;
+  
+  if (status) {
+    status->sa_serv_storage_sz = sizeof (status->sa_serv_storage);
+    status->sa_cli_storage_sz = sizeof (status->sa_cli_storage);
 
-int print_qrcode(FILE* f, const QRcode* qrcode);
+    if ((gerr = gpgme_new(&status->gpgctx))) {
+      fprintf(stderr, "gpgme_new failed: (%d), %s\n", gerr, gpgme_strerror(gerr));
+      goto fail;
+    }
+
+    /* choose random number */  
+    if ((rc = gnutls_key_generate(&status->psk, PSK_BYTES))) {
+      fprintf(stderr, "failed to get randomness: (%d) %s\n", rc, gnutls_strerror(rc));
+      goto fail;
+    }
+    if ((rc = gnutls_hex_encode(&status->psk, status->pskhex, &pskhexsz))) {
+      fprintf(stderr, "failed to encode PSK as a hex string: (%d) %s\n", rc, gnutls_strerror(rc));
+      goto fail;
+    }
+    if (pskhexsz != sizeof(status->pskhex)) {
+      fprintf(stderr, "bad calculation for psk size\n");
+      goto fail;
+    }
+    for (int ix = 0; ix < sizeof(status->pskhex)-1; ix++)
+      status->pskhex[ix] = toupper(status->pskhex[ix]);
+  }
+  return status;
+ fail:
+  session_status_free(status);
+  return NULL;
+}
+
+int session_status_choose_address(struct session_status* status) {
+  struct ifaddrs *ifa;
+  struct sockaddr *myaddr = NULL;
+  int myfamily = 0;
+  int rc;
+  int optval = 1;
+  
+  /* pick an IP address with getifaddrs instead of using in6addr_any */
+  if (getifaddrs(&status->ifap)) {
+    fprintf(stderr, "getifaddrs failed: (%d) %s\n", errno, strerror(errno));
+    return -1;
+  }
+  for (ifa = status->ifap; ifa; ifa = ifa->ifa_next) {
+    char addrstring[INET6_ADDRSTRLEN];
+    bool skip = false;
+    int family = 0;
+    
+    if (ifa->ifa_addr) {
+      family = ((struct sockaddr_storage*)(ifa->ifa_addr))->ss_family;
+      void * ptr = NULL;
+      if (family == AF_INET6)
+        ptr = &((struct sockaddr_in6*)(ifa->ifa_addr))->sin6_addr;
+      else if (family == AF_INET)
+        ptr = &((struct sockaddr_in*)(ifa->ifa_addr))->sin_addr;
+      else if (family == AF_PACKET) 
+        skip = true; /* struct rtnl_link_stats *stats = ifa->ifa_data */
+      if (!skip)
+        inet_ntop(family, ptr, addrstring, sizeof(addrstring));
+      else
+        strcpy(addrstring, "<unknown family>");
+    } else {
+      strcpy(addrstring, "<no address>");
+    }
+    if (ifa->ifa_flags & IFF_LOOPBACK) {
+      if (LOG_LEVEL > 2)
+        fprintf(stderr, "skipping %s because it is loopback\n", ifa->ifa_name);
+      continue;
+    }
+    if (!(ifa->ifa_flags & IFF_UP)) {
+      if (LOG_LEVEL > 2)
+        fprintf(stderr, "skipping %s because it is not up\n", ifa->ifa_name);
+      continue;
+    }
+    if (!skip) {
+      if (LOG_LEVEL > 2)
+        fprintf(stdout, "%s %s: %s (flags: 0x%x)\n", myaddr==NULL?"*":" ", ifa->ifa_name, addrstring, ifa->ifa_flags);
+      /* FIXME: we're just taking the first up, non-loopback address */
+      /* be cleverer about prefering wifi, preferring link-local addresses, and RFC1918 addressses. */
+      if (myaddr == NULL) {
+        myfamily = family;
+        myaddr = ifa->ifa_addr;
+      }
+    }
+  }
+
+  if (myfamily == 0) {
+    fprintf(stderr, "could not find an acceptable address to bind to.\n");
+    return -1;
+  }
+  
+  /* open listening socket */
+  status->listen_socket = socket(myfamily, SOCK_STREAM, 0);
+  if (status->listen_socket == -1) {
+    fprintf(stderr, "failed to allocate a socket of type %d: (%d) %s\n", myfamily, errno, strerror(errno));
+    return -1;
+  }
+  if ((rc = setsockopt(status->listen_socket, SOL_SOCKET, SO_REUSEADDR, (void *) &optval, sizeof(int)))) {
+    fprintf(stderr, "failed to set SO_REUSEADDR: (%d) %s\n", errno, strerror(errno));
+    return -1;
+  }
+  if ((rc = bind(status->listen_socket, myaddr, myfamily == AF_INET ? sizeof(struct sockaddr_in) : sizeof(struct sockaddr_in6)))) {
+    fprintf(stderr, "failed to bind: (%d) %s\n", errno, strerror(errno));
+    return -1;
+  }    
+  if ((rc = getsockname(status->listen_socket, (struct sockaddr *) &status->sa_serv_storage, &status->sa_serv_storage_sz))) {
+    fprintf(stderr, "failed to getsockname: (%d) %s\n", errno, strerror(errno));
+    return -1;
+  }
+  if (status->sa_serv_storage_sz > sizeof(status->sa_serv_storage)) {
+    fprintf(stderr, "needed more space (%d) than expected (%zd) for getsockname\n", status->sa_serv_storage_sz, sizeof(status->sa_serv_storage));
+    return -1;
+  }
+  if (status->sa_serv_storage.ss_family != myfamily) {
+    fprintf(stderr, "was expecting address family %d after binding, got %d\n", myfamily, status->sa_serv_storage.ss_family);
+    return -1;
+  }
+  if (print_address_name(&status->sa_serv_storage, status->addrp, sizeof(status->addrp), &status->port))
+    return -1;
+  if ((rc = listen(status->listen_socket, 0))) {
+    fprintf(stderr, "failed to listen: (%d) %s\n", errno, strerror(errno));
+    return -1;
+  }
+  return 0;
+}
 
 
 int get_psk_creds(gnutls_session_t session, const char* username, gnutls_datum_t* key) {
@@ -197,24 +319,14 @@ int main(int argc, const char *argv[]) {
   int rc;
   gnutls_psk_server_credentials_t creds = NULL;
   gnutls_priority_t priority_cache;
-  int optval = 1;
-  size_t pskhexsz = sizeof(status->pskhex);
   char urlbuf[INET6_ADDRSTRLEN + 25 + 32];
   int urllen;
   QRcode *qrcode = NULL;
-  struct ifaddrs *ifa;
-  struct sockaddr *myaddr = NULL;
-  int myfamily = 0;
-  gpgme_error_t gerr = GPG_ERR_NO_ERROR;
   FILE * inkey = NULL;
 
-  status = session_status_new();
-  if (!status) {
-    fprintf(stderr, "Failed to initialize status object\n");
-    return -1;
-  }
-      
-  
+  gpgme_check_version (NULL);
+  gnutls_global_set_log_level(LOG_LEVEL);
+  gnutls_global_set_log_function(skt_log);
 
   if (argc > 1) {
     if (!strcmp(argv[1], "-")) {
@@ -226,117 +338,14 @@ int main(int argc, const char *argv[]) {
                 argv[1], errno, strerror(errno));
     }
   }
-    
-  gpgme_check_version (NULL);
-  if ((gerr = gpgme_new(&status->gpgctx))) {
-    fprintf(stderr, "gpgme_new failed: (%d), %s\n", gerr, gpgme_strerror(gerr));
-  }
-  
-  gnutls_global_set_log_level(LOG_LEVEL);
-  gnutls_global_set_log_function(skt_log);
-  
-  /* choose random number */  
-  if ((rc = gnutls_key_generate(&status->psk, PSK_BYTES))) {
-    fprintf(stderr, "failed to get randomness: (%d) %s\n", rc, gnutls_strerror(rc));
-    return -1;
-  }
-  if ((rc = gnutls_hex_encode(&status->psk, status->pskhex, &pskhexsz))) {
-    fprintf(stderr, "failed to encode PSK as a hex string: (%d) %s\n", rc, gnutls_strerror(rc));
-    return -1;
-  }
-  if (pskhexsz != sizeof(status->pskhex)) {
-    fprintf(stderr, "bad calculation for psk size\n");
-    return -1;
-  }
-  for (int ix = 0; ix < sizeof(status->pskhex)-1; ix++)
-    status->pskhex[ix] = toupper(status->pskhex[ix]);
-  
-  /* pick an IP address with getifaddrs instead of using in6addr_any */
-  if (getifaddrs(&status->ifap)) {
-    fprintf(stderr, "getifaddrs failed: (%d) %s\n", errno, strerror(errno));
-    return -1;
-  }
-  for (ifa = status->ifap; ifa; ifa = ifa->ifa_next) {
-    char addrstring[INET6_ADDRSTRLEN];
-    bool skip = false;
-    int family = 0;
-    
-    if (ifa->ifa_addr) {
-      family = ((struct sockaddr_storage*)(ifa->ifa_addr))->ss_family;
-      void * ptr = NULL;
-      if (family == AF_INET6)
-        ptr = &((struct sockaddr_in6*)(ifa->ifa_addr))->sin6_addr;
-      else if (family == AF_INET)
-        ptr = &((struct sockaddr_in*)(ifa->ifa_addr))->sin_addr;
-      else if (family == AF_PACKET) 
-        skip = true; /* struct rtnl_link_stats *stats = ifa->ifa_data */
-      if (!skip)
-        inet_ntop(family, ptr, addrstring, sizeof(addrstring));
-      else
-        strcpy(addrstring, "<unknown family>");
-    } else {
-      strcpy(addrstring, "<no address>");
-    }
-    if (ifa->ifa_flags & IFF_LOOPBACK) {
-      if (LOG_LEVEL > 2)
-        fprintf(stderr, "skipping %s because it is loopback\n", ifa->ifa_name);
-      continue;
-    }
-    if (!(ifa->ifa_flags & IFF_UP)) {
-      if (LOG_LEVEL > 2)
-        fprintf(stderr, "skipping %s because it is not up\n", ifa->ifa_name);
-      continue;
-    }
-    if (!skip) {
-      if (LOG_LEVEL > 2)
-        fprintf(stdout, "%s %s: %s (flags: 0x%x)\n", myaddr==NULL?"*":" ", ifa->ifa_name, addrstring, ifa->ifa_flags);
-      /* FIXME: we're just taking the first up, non-loopback address */
-      /* be cleverer about prefering wifi, preferring link-local addresses, and RFC1918 addressses. */
-      if (myaddr == NULL) {
-        myfamily = family;
-        myaddr = ifa->ifa_addr;
-      }
-    }
-  }
 
-  if (myfamily == 0) {
-    fprintf(stderr, "could not find an acceptable address to bind to.\n");
+  status = session_status_new();
+  if (!status) {
+    fprintf(stderr, "Failed to initialize status object\n");
     return -1;
   }
-  
-  /* open listening socket */
-  status->listen_socket = socket(myfamily, SOCK_STREAM, 0);
-  if (status->listen_socket == -1) {
-    fprintf(stderr, "failed to allocate a socket of type %d: (%d) %s\n", myfamily, errno, strerror(errno));
+  if (session_status_choose_address(status))
     return -1;
-  }
-  if ((rc = setsockopt(status->listen_socket, SOL_SOCKET, SO_REUSEADDR, (void *) &optval, sizeof(int)))) {
-    fprintf(stderr, "failed to set SO_REUSEADDR: (%d) %s\n", errno, strerror(errno));
-    return -1;
-  }
-  if ((rc = bind(status->listen_socket, myaddr, myfamily == AF_INET ? sizeof(struct sockaddr_in) : sizeof(struct sockaddr_in6)))) {
-    fprintf(stderr, "failed to bind: (%d) %s\n", errno, strerror(errno));
-    return -1;
-  }    
-  if ((rc = getsockname(status->listen_socket, (struct sockaddr *) &status->sa_serv_storage, &status->sa_serv_storage_sz))) {
-    fprintf(stderr, "failed to getsockname: (%d) %s\n", errno, strerror(errno));
-    return -1;
-  }
-  if (status->sa_serv_storage_sz > sizeof(status->sa_serv_storage)) {
-    fprintf(stderr, "needed more space (%d) than expected (%zd) for getsockname\n", status->sa_serv_storage_sz, sizeof(status->sa_serv_storage));
-    return -1;
-  }
-  if (status->sa_serv_storage.ss_family != myfamily) {
-    fprintf(stderr, "was expecting address family %d after binding, got %d\n", myfamily, status->sa_serv_storage.ss_family);
-    return -1;
-  }
-  if (print_address_name(&status->sa_serv_storage, status->addrp, sizeof(status->addrp), &status->port))
-    return -1;
-  if ((rc = listen(status->listen_socket, 0))) {
-    fprintf(stderr, "failed to listen: (%d) %s\n", errno, strerror(errno));
-    return -1;
-  }    
-
   
   /* open tls server connection */
   if ((rc = gnutls_init(&status->session, GNUTLS_SERVER))) {
@@ -371,7 +380,10 @@ int main(int argc, const char *argv[]) {
 
   /* construct string */
   urlbuf[sizeof(urlbuf)-1] = 0;
-  urllen = snprintf(urlbuf, sizeof(urlbuf)-1, "%s://%s@%s%s%s:%d", schema, status->pskhex, myfamily==AF_INET6?"[":"", status->addrp, myfamily==AF_INET6?"]":"", status->port);
+  urllen = snprintf(urlbuf, sizeof(urlbuf)-1, "%s://%s@%s%s%s:%d", schema, status->pskhex,
+                    status->sa_serv_storage.ss_family==AF_INET6?"[":"",
+                    status->addrp,
+                    status->sa_serv_storage.ss_family==AF_INET6?"]":"", status->port);
   if (urllen >= (sizeof(urlbuf)-1)) {
     fprintf(stderr, "buffer was somehow truncated.\n");
     return -1;
