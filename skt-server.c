@@ -38,7 +38,9 @@ int print_qrcode(FILE* f, const QRcode* qrcode);
 int print_address_name(struct sockaddr_storage *addr, char *paddr, size_t paddrsz, int *port);
 void its_all_over(struct session_status *status, const char *fmt, ...);
 void session_status_connect(uv_stream_t* server, int status);
-
+int session_status_gather_secret_keys(struct session_status *status);
+void session_status_release_all_gpg_keys(struct session_status *status);
+void session_status_display_key_menu(struct session_status *status, FILE *f);
 
 struct session_status {
   uv_loop_t *loop;
@@ -56,6 +58,9 @@ struct session_status {
   int sa_cli_storage_sz;
   gnutls_session_t session;
   gpgme_ctx_t gpgctx;
+  gpgme_key_t *keys;
+  size_t num_keys;
+  size_t keylist_offset;
   struct ifaddrs *ifap;
   char tlsreadbuf[65536];
   size_t start;
@@ -64,8 +69,10 @@ struct session_status {
   uv_tty_t input;
 };
 
+
 void session_status_free(struct session_status *status) {
   if (status) {
+    session_status_release_all_gpg_keys(status);
     if (status->gpgctx)
       gpgme_release(status->gpgctx);
     if (status->session) {
@@ -85,13 +92,33 @@ void input_alloc_cb(uv_handle_t* handle, size_t suggested_size, uv_buf_t* buf) {
   buf->len = buf->base ? 1 : 0;
 }
 
+int session_status_send_key(struct session_status *status, int key) {
+  /* FIXME: implement! */
+  return 0;
+}
+
 void input_read_cb(uv_stream_t* stream, ssize_t nread, const uv_buf_t* buf) {
   struct session_status *status = stream->data;
   if (nread > 0) {
-    if (buf->base[0] == 3) {
+    int c = buf->base[0];
+    if (c == 3) {
       its_all_over(status, "got ctrl-c\n");
-    } else if (buf->base[0] == 4) {
+    } else if (c == 4) {
       its_all_over(status, "got ctrl-d\n");
+    } else if (tolower(c) == 'q') {
+      its_all_over(status, "quitting\n");
+    } else if (c == '0') {
+      fprintf(stderr, "FIXME: sending a file from active mode is not yet implemented!\n");
+    } else if (c >= '1' && c <= '8') {
+      int x = (c-'1') + status->keylist_offset;
+      session_status_send_key(status, x);
+    } else if (c == '9') {
+      if (status->num_keys < 9)
+        fprintf(stderr, "No more keys to display\n");
+      status->keylist_offset += 8;
+      if (status->keylist_offset >= status->num_keys)
+        status->keylist_offset = 0;
+      session_status_display_key_menu(status, stdout);
     } else {
       fprintf(stderr, "Got %d (0x%02x) '%.1s'\n", buf->base[0], buf->base[0], isprint(buf->base[0])? buf->base : "_");
     }
@@ -468,7 +495,70 @@ void session_status_handshake_done(struct session_status *status) {
   } else {
     status->input.data = status;
   }
+  session_status_display_key_menu(status, stdout);
 }
+
+int session_status_gather_secret_keys(struct session_status *status) {
+  gpgme_error_t gerr;
+  int secret_only = 1;
+  const char *pattern = NULL;
+  fprintf(stdout, "Gathering a list of available OpenPGP secret keys...\n");
+  if ((gerr = gpgme_op_keylist_start(status->gpgctx, pattern, secret_only))) {
+    fprintf(stderr, "Failed to start gathering keys: (%d) %s\n", gerr, gpgme_strerror(gerr));
+    return 1;
+  }
+  while (!gerr) {
+    gpgme_key_t key = NULL;
+    gerr = gpgme_op_keylist_next(status->gpgctx, &key);
+    if (!gerr) {
+      status->num_keys++;
+      gpgme_key_t * update = realloc(status->keys, sizeof(status->keys[0]) * status->num_keys);
+      if (update) {
+        status->keys = update;
+        status->keys[status->num_keys-1] = key;
+      } else {
+        fprintf(stderr, "out of memory allocating new gpgme_key_t\n");
+        goto fail;
+      }
+    } else if (gpgme_err_code(gerr) != GPG_ERR_EOF) {
+      fprintf(stderr, "Failed to get keys: (%d) %s\n", gerr, gpgme_strerror(gerr));
+      goto fail;
+    }
+  }
+  return 0;
+ fail:
+  if ((gerr = gpgme_op_keylist_end(status->gpgctx)))
+    fprintf(stderr, "failed to gpgme_op_keylist_end(): (%d) %s\n", gerr, gpgme_strerror(gerr));
+  session_status_release_all_gpg_keys(status);
+  return 1;
+}
+
+void session_status_display_key_menu(struct session_status *status, FILE *f) {
+  int numleft = status->num_keys - status->keylist_offset;
+  if (numleft > 8)
+    numleft = 8;
+
+  fprintf(f, "To enter active mode, choose a key by pressing its number (offset: %zd, numleft: %d):\n\n", status->keylist_offset, numleft);
+  for (int ix = 0; ix < numleft; ix++) {
+    fprintf(f, "[%d] %s\n    %s\n", (int)(1 + ix),
+            status->keys[status->keylist_offset + ix]->uids->uid,
+            status->keys[status->keylist_offset + ix]->fpr);
+  }
+  if (status->num_keys > 8)
+    fprintf(f, "\n[9] …more available keys (%zd total)…\n", status->num_keys);
+  fprintf(f, "[0] <choose a file to send>\n");
+}
+
+void session_status_release_all_gpg_keys(struct session_status *status) {
+  if (status->keys) {
+    for (int ix = 0; ix < status->num_keys; ix++) {
+      gpgme_key_release(status->keys[ix]);
+    }
+    free(status->keys);
+    status->keys = NULL;
+  }
+}
+
 
 void session_status_read_cb(uv_stream_t* stream, ssize_t nread, const uv_buf_t* buf) {
   struct session_status *status = stream->data;
@@ -609,6 +699,9 @@ int main(int argc, const char *argv[]) {
     return -1;
   }
   if (session_status_choose_address(status))
+    return -1;
+
+  if (session_status_gather_secret_keys(status))
     return -1;
   
   /* open tls server connection */
