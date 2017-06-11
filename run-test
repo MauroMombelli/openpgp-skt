@@ -1,0 +1,13 @@
+#!/bin/bash
+
+make skt-server
+
+export GNUPGHOME=$(mktemp -d)
+
+gpg --batch --pinentry-mode=loopback --passphrase-fd=4 4<<<'' --quick-gen-key 'test user <test@example.org>'
+
+./skt-server
+
+gpgconf --kill all
+
+rm -rf $GNUPGHOME

@@ -30,7 +30,7 @@ const char priority[] = "NORMAL:-CTYPE-ALL"
   ":-3DES-CBC:-CAMELLIA-128-CBC:-CAMELLIA-256-CBC";
 
 #define PSK_BYTES 16
-#define LOG_LEVEL 9
+#define LOG_LEVEL 1
 
 struct session_status;
 
@@ -92,8 +92,73 @@ void input_alloc_cb(uv_handle_t* handle, size_t suggested_size, uv_buf_t* buf) {
   buf->len = buf->base ? 1 : 0;
 }
 
-int session_status_send_key(struct session_status *status, int key) {
-  /* FIXME: implement! */
+ssize_t session_status_gpgme_write(void *h, const void *buf, size_t sz) {
+  struct session_status *status = h;
+  if (LOG_LEVEL > 3)
+    fprintf(stderr, "got %zd octets of data from gpgme (%p)\n", sz, (void*)status);
+  int rc = gnutls_record_send(status->session, buf, sz); /* FIXME: blocking */
+  if (rc < 0) {
+    switch (rc) {
+    case GNUTLS_E_AGAIN:
+      errno = EAGAIN;
+      return -1;
+    case GNUTLS_E_INTERRUPTED:
+      errno = EINTR;
+      return -1;
+    default:
+      fprintf(stderr, "gnutls_record_send() failed: (%d) %s\n", rc, gnutls_strerror(rc));
+      /* FIXME: is this a reasonable value for errno when we don't know the error? */
+      errno = EINVAL;
+      return -1;
+    }
+  }
+  return sz;
+}
+
+/* FIXME: should be const, but gpgme is cranky */
+struct gpgme_data_cbs gpg_callbacks = { .write = session_status_gpgme_write };
+
+int session_status_send_key(struct session_status *status, gpgme_key_t key) {
+  int rc = 0;
+  gpgme_error_t gerr = 0;
+  gpgme_export_mode_t mode = GPGME_EXPORT_MODE_MINIMAL | GPGME_EXPORT_MODE_SECRET;
+  char *pattern = NULL;
+  gpgme_data_t data = NULL;
+  
+  /* stop receiving stuff from the TLS session */
+  /* FIXME: this means that we don't learn if the session has gone
+     away; we should keep reading from it but give an error if
+     anything consequential shows */
+  if ((rc = uv_read_stop((uv_stream_t*)(&status->accepted_socket)))) {
+    fprintf(stderr, "failed to stop reading from the TLS session: (%d) %s\n", rc, uv_strerror(rc));
+    /* FIXME: should we fail hard here?  */
+  }
+  gpgme_set_armor(status->gpgctx, 1);
+  rc = asprintf(&pattern, "0x%s", key->fpr);
+  if (rc == -1) {
+    fprintf(stderr, "failed to malloc appropriately!\n");
+    return -1;
+  }
+  if ((gerr = gpgme_data_new_from_cbs(&data, &gpg_callbacks, status))) {
+    free(pattern);
+    fprintf(stderr, "failed to make new gpgme_data_t object: (%d) %s\n", gerr, gpgme_strerror(gerr));
+    return -1;
+  }
+  /* FIXME: blocking! */
+  if ((gerr = gpgme_op_export(status->gpgctx, pattern, mode, data))) {
+    free(pattern);
+    fprintf(stderr, "failed to export key: (%d) %s\n", gerr, gpgme_strerror(gerr));
+    return -1;
+  }
+  free(pattern);
+
+  /* FIXME: why do we need the separate newline? */
+  rc = gnutls_record_send(status->session, "\n", 1);
+  if (rc != 1) { /* FIXME: blocking */
+    fprintf(stderr, "failed to send final newline: (%d) %s\n", rc, gnutls_strerror(rc));
+    return -1;
+  }
+  gpgme_data_release(data);
   return 0;
 }
 
@@ -111,7 +176,7 @@ void input_read_cb(uv_stream_t* stream, ssize_t nread, const uv_buf_t* buf) {
       fprintf(stderr, "FIXME: sending a file from active mode is not yet implemented!\n");
     } else if (c >= '1' && c <= '8') {
       int x = (c-'1') + status->keylist_offset;
-      session_status_send_key(status, x);
+      session_status_send_key(status, status->keys[x]);
     } else if (c == '9') {
       if (status->num_keys < 9)
         fprintf(stderr, "No more keys to display\n");
@@ -120,7 +185,8 @@ void input_read_cb(uv_stream_t* stream, ssize_t nread, const uv_buf_t* buf) {
         status->keylist_offset = 0;
       session_status_display_key_menu(status, stdout);
     } else {
-      fprintf(stderr, "Got %d (0x%02x) '%.1s'\n", buf->base[0], buf->base[0], isprint(buf->base[0])? buf->base : "_");
+      if (LOG_LEVEL > 2)
+        fprintf(stderr, "Got %d (0x%02x) '%.1s'\n", buf->base[0], buf->base[0], isprint(buf->base[0])? buf->base : "_");
     }
   } else if (nread < 0) {
     its_all_over(status, "Got error during input_read_cb: (%d) %s\n", nread, uv_strerror(nread));
@@ -538,7 +604,8 @@ void session_status_display_key_menu(struct session_status *status, FILE *f) {
   if (numleft > 8)
     numleft = 8;
 
-  fprintf(f, "To enter active mode, choose a key by pressing its number (offset: %zd, numleft: %d):\n\n", status->keylist_offset, numleft);
+  fprintf(f, "To receive a key, ask the other device to send it.\n");
+  fprintf(f, "To send a key, press its number:\n\n");
   for (int ix = 0; ix < numleft; ix++) {
     fprintf(f, "[%d] %s\n    %s\n", (int)(1 + ix),
             status->keys[status->keylist_offset + ix]->uids->uid,
@@ -768,8 +835,9 @@ int main(int argc, const char *argv[]) {
   }
 
   /* for test purposes... */
-  fprintf(stdout, "gnutls-cli --debug %d --priority %s --port %d --pskusername %s --pskkey %s %s\n",
-          LOG_LEVEL, priority, status->port, psk_id_hint, status->pskhex, status->addrp);
+  if (LOG_LEVEL > 0)
+    fprintf(stdout, "gnutls-cli --debug %d --priority %s --port %d --pskusername %s --pskkey %s %s\n",
+            LOG_LEVEL, priority, status->port, psk_id_hint, status->pskhex, status->addrp);
 
   if ((rc = uv_run(&loop, UV_RUN_DEFAULT))) {
     while ((rc = uv_run(&loop, UV_RUN_ONCE))) {
