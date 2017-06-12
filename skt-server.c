@@ -36,6 +36,12 @@ const char pgp_end[] = "\n-----END PGP PRIVATE KEY BLOCK-----";
 
 struct session_status;
 
+struct imported_key {
+  char *fpr;
+  gpgme_key_t key;
+  bool refresh;
+};
+
 int print_qrcode(FILE* f, const QRcode* qrcode);
 int print_address_name(struct sockaddr_storage *addr, char *paddr, size_t paddrsz, int *port);
 void its_all_over(struct session_status *status, const char *fmt, ...);
@@ -43,7 +49,9 @@ void session_status_connect(uv_stream_t* server, int status);
 int session_status_gather_secret_keys(struct session_status *status);
 void session_status_release_all_gpg_keys(struct session_status *status);
 void session_status_display_key_menu(struct session_status *status, FILE *f);
+void session_status_display_incoming_key_menu(struct session_status *status, FILE *f);
 int session_status_close_tls(struct session_status *status);
+void session_status_import_incoming_key(struct session_status *status, gpgme_key_t k);
 
 
 struct session_status {
@@ -66,9 +74,15 @@ struct session_status {
   char *incomingdir;
   gnutls_datum_t incomingkey;
   size_t incomingkeylen;
+
+  struct imported_key *inkeys;
+  size_t num_inkeys;
+  size_t inkeylist_offset;
+  
   gpgme_key_t *keys;
   size_t num_keys;
   size_t keylist_offset;
+  
   struct ifaddrs *ifap;
   char tlsreadbuf[65536];
   size_t start;
@@ -140,6 +154,10 @@ ssize_t session_status_gpgme_write(void *h, const void *buf, size_t sz) {
 /* FIXME: should be const, but gpgme is cranky */
 struct gpgme_data_cbs gpg_callbacks = { .write = session_status_gpgme_write };
 
+int session_status_import_incoming_key(struct session_status *status, gpgme_key_t k) {
+  /* FIXME: this needs to be finished! */
+}
+
 int session_status_send_key(struct session_status *status, gpgme_key_t key) {
   int rc = 0;
   gpgme_error_t gerr = 0;
@@ -171,25 +189,56 @@ int session_status_send_key(struct session_status *status, gpgme_key_t key) {
   return 0;
 }
 
+void ctrl_c(struct session_status *status) {
+  its_all_over(status, "got ctrl-c\n");
+}
+
+void ctrl_d(struct session_status *status) {
+  its_all_over(status, "got ctrl-d\n");
+}
+
+
+void ctrl_l(struct session_status *status) {
+  /* FIXME: refresh the screen */
+}
+
+void quit(struct session_status *status) {
+  its_all_over(status, "quitting…\n");
+}
+
 void input_read_cb(uv_stream_t* stream, ssize_t nread, const uv_buf_t* buf) {
   struct session_status *status = stream->data;
   if (nread > 0) {
     int c = buf->base[0];
     if (c == 3) {
-      its_all_over(status, "got ctrl-c\n");
+      ctrl_c(status);
     } else if (c == 4) {
-      its_all_over(status, "got ctrl-d\n");
+      ctrl_d(status);
+    } else if (c == 12) {
+      ctrl_l(status);
     } else if (tolower(c) == 'q' || c == 0x1B /* ESC */) {
-      its_all_over(status, "quitting\n");
+      quit(status);
     } else if (status->incomingdir) {
-      if (status->log_level > 2)
-        fprintf(stderr, "In passive mode.  Cannot send keys.  Quit and reconnect to take the active role.\n");
+      if (c >= '0' && c <= '9') {
+        fprintf(stderr, "The other device is already sending keys.\nQuit and reconnect to push keys the other way.\n");
+      } else if (c >= 'a' && c <= ('a' + 7)) {
+        int x = (c - 'a') + status->inkeylist_offset;
+        session_status_import_incoming_key(status, status->inkeys[x].key);
+      } else if (c == 'n') {
+      if (status->num_inkeys < 9)
+        fprintf(stderr, "No more keys to display\n");
+      status->inkeylist_offset += 8;
+      if (status->inkeylist_offset >= status->num_inkeys)
+        status->inkeylist_offset = 0;
+      session_status_display_incoming_key_menu(status, stdout);
+
+      }
     } else if (c == '0') {
       fprintf(stderr, "FIXME: sending a file from active mode is not yet implemented!\n");
     } else if (c >= '1' && c <= '8') {
       int x = (c-'1') + status->keylist_offset;
       session_status_send_key(status, status->keys[x]);
-    } else if (c == '9') {
+    } else if (c == '9' || c == 'n') {
       if (status->num_keys < 9)
         fprintf(stderr, "No more keys to display\n");
       status->keylist_offset += 8;
@@ -222,7 +271,7 @@ int session_status_setup_incoming(struct session_status *status) {
 
   assert(status->incoming == NULL);
   
-  if (xdg != NULL) {
+  if (xdg == NULL) {
     rc = asprintf(&xdg, "/run/user/%d", getuid());
     if (rc == -1) {
       fprintf(stderr, "failed to guess user ID during ephemeral GnuPG setup.\r\n");
@@ -265,6 +314,8 @@ int session_status_setup_incoming(struct session_status *status) {
     goto fail;
   }
 
+  if (xdgf)
+    free(xdg);
   return 0;
  fail:
   if (xdgf)
@@ -695,17 +746,45 @@ void session_status_display_key_menu(struct session_status *status, FILE *f) {
   if (numleft > 8)
     numleft = 8;
 
+  if (!status->num_keys)
+    fprintf(f, "You have no secret keys that you can send.\n");
   fprintf(f, "To receive a key, ask the other device to send it.\n");
-  fprintf(f, "To send a key, press its number:\n\n");
-  for (int ix = 0; ix < numleft; ix++) {
-    fprintf(f, "[%d] %s\n    %s\n", (int)(1 + ix),
-            status->keys[status->keylist_offset + ix]->uids->uid,
-            status->keys[status->keylist_offset + ix]->fpr);
+
+  if (status->num_keys) {
+    fprintf(f, "To send a key, press its number:\n\n");
+    for (int ix = 0; ix < numleft; ix++) {
+      fprintf(f, "[%d] %s\n    %s\n", (int)(1 + ix),
+              status->keys[status->keylist_offset + ix]->uids->uid,
+              status->keys[status->keylist_offset + ix]->fpr);
+    }
+    if (status->num_keys > 8)
+      fprintf(f, "\n[9] …more available keys (%zd total)…\n", status->num_keys);
   }
-  if (status->num_keys > 8)
-    fprintf(f, "\n[9] …more available keys (%zd total)…\n", status->num_keys);
-  fprintf(f, "[0] <choose a file to send>\n");
+  fprintf(f, "[0] <choose a file to send>\n[q] to quit\n");
 }
+
+void session_status_display_incoming_key_menu(struct session_status *status, FILE *f) {
+  int numleft = status->num_inkeys - status->inkeylist_offset;
+  if (numleft > 8)
+    numleft = 8;
+
+  if (!status->num_inkeys) {
+    fprintf(f, "The other device has started sending keys, but no valid keys have arrived yet.\n");
+  } else {
+    fprintf(f, "To import a key, press its letter:\n\n");
+    for (int ix = 0; ix < numleft; ix++) {
+      fprintf(f, "[%c] %s\n", ('a' + ix),
+              status->inkeys[status->inkeylist_offset + ix].fpr);
+      for (gpgme_user_id_t uid = status->inkeys[status->inkeylist_offset + ix].key->uids; uid; uid = uid->next)
+        fprintf(f, "    %s\n", uid->uid);
+      fprintf(f, "\n");
+    }
+    if (status->num_inkeys > 8)
+      fprintf(f, "\n[n] …more available keys (%zd total)…\n", status->num_inkeys);
+  }
+  fprintf(f, "[q] to quit\n");
+}
+
 
 void session_status_release_all_gpg_keys(struct session_status *status) {
   if (status->keys) {
@@ -714,12 +793,22 @@ void session_status_release_all_gpg_keys(struct session_status *status) {
     }
     free(status->keys);
     status->keys = NULL;
+    status->num_keys = 0;
   }
+  if (status->inkeys) {
+    for (int ix = 0; ix < status->num_inkeys; ix++) {
+      free(status->inkeys[ix].fpr);
+      gpgme_key_release(status->inkeys[ix].key);
+    }
+    free(status->inkeys);
+    status->inkeys = NULL;
+    status->num_inkeys = 0;
+  }
+  
 }
 
 /* appends SUFFIX to position POS in BASE, growing BASE if necessary */
 int append_data(gnutls_datum_t *base, const gnutls_datum_t *suffix, size_t pos) {
-  fprintf(stderr, "base->data: %p, suffix->size: %u, pos: %zu\n", base->data, suffix->size, pos);
   size_t newlen = pos + suffix->size;
   if (base->size < newlen) {
     unsigned char *newdata = realloc(base->data, newlen);
@@ -732,13 +821,96 @@ int append_data(gnutls_datum_t *base, const gnutls_datum_t *suffix, size_t pos) 
   return 0;
 }
 
+void session_status_record_fingerprint(struct session_status *status, const char *fpr) {
+  /* check if we already have it */
+  for (int ix = 0; ix < status->num_inkeys; ix++) {
+    if (!strcmp(status->inkeys[ix].fpr, fpr)) {
+      status->inkeys[ix].refresh = true;
+      return;
+    }
+  }
+
+  /* if we do not yet, then add it */
+  struct imported_key *newlist = realloc(status->inkeys, sizeof(status->inkeys[0])*(status->num_inkeys+1));
+  if (!newlist) {
+    fprintf(stderr, "Failed to allocate more RAM for incoming key, skipping fingerprint %s\n", fpr);
+    return;
+  }
+  status->inkeys = newlist;
+  struct imported_key *newkey = status->inkeys + status->num_inkeys;
+  status->num_inkeys++;
+  newkey->fpr = strdup(fpr);
+  newkey->key = NULL;
+  newkey->refresh = true;
+  /* cannot grab info from gpgme ctx yet because we're still in the
+     gpgme_op_get_import_result :( */
+}
+
+int session_status_load_incoming_keys(struct session_status *status) {
+  gpgme_error_t gerr;
+  int secret = 1;
+  int ret = 0;
+  bool refreshed = false;
+  for (struct imported_key *k = status->inkeys; k < status->inkeys + status->num_inkeys; k++) {
+    if (k->key == NULL || k->refresh) {
+      if (k->key) {
+        gpgme_key_release(k->key);
+        k->key = NULL;
+      }
+      if ((gerr = gpgme_get_key(status->incoming, k->fpr, &k->key, secret))) {
+        fprintf(stderr, "Failed to get incoming key with fingerprint %s: (%d) %s\n",
+                k->fpr, gerr, gpgme_strerror(gerr));
+        ret = EIO;
+      } else
+        refreshed = true;
+    }
+  }
+
+  if (refreshed)
+    session_status_display_incoming_key_menu(status, stdout);
+  return ret;
+}
+
 int session_status_ingest_key(struct session_status *status, unsigned char *ptr, size_t sz) {
-  return ENOSYS;
+  gpgme_data_t d;
+  gpgme_error_t gerr;
+  int copy = 0;
+  gpgme_import_result_t result = NULL;
+  gpgme_import_status_t newkey = NULL;
+    
+  assert(status->incoming);
+  
+  if ((gerr = gpgme_data_new_from_mem(&d, (const char *)ptr, sz, copy))) {
+    fprintf(stderr, "Failed to allocate new gpgme_data_t: (%d) %s\n", gerr, gpgme_strerror(gerr));
+    return ENOMEM;
+  }
+  gerr = gpgme_op_import(status->incoming, d);
+  gpgme_data_release(d);
+  if (gerr) {
+    fprintf(stderr, "Failed to import key: (%d) %s\n", gerr, gpgme_strerror(gerr));
+    return ENOMEM;
+  }
+
+  result = gpgme_op_import_result(status->incoming);
+  if (!result) {
+    fprintf(stderr, "something went wrong during import to GnuPG\n");
+    return EIO;
+  }
+  if (status->log_level > 2)
+    fprintf(stderr, "Imported %d secret keys\n", result->secret_imported);
+
+  for (newkey = result->imports; newkey; newkey = newkey->next) {
+    if ((newkey->result == GPG_ERR_NO_ERROR) &&
+        (newkey->status & (GPGME_IMPORT_NEW | GPGME_IMPORT_SECRET))) {
+      session_status_record_fingerprint(status, newkey->fpr);
+    }
+  }
+  return session_status_load_incoming_keys(status);
 }
 
 /* look through the incoming data stream and if it contains a key, try
    to ingest it.  FIXME: it's a bit wasteful to perform this scan of
-   the whole buffer every time a packet comes in; should really be
+   the whole buffer every time a TLS record comes in; should really be
    done in true async form, with the state stored in status someplace. */
 int session_status_try_incoming_keys(struct session_status *status) {
   unsigned char *key = status->incomingkey.data;
@@ -889,6 +1061,7 @@ void session_status_read_cb(uv_stream_t* stream, ssize_t nread, const uv_buf_t* 
           its_all_over(status, "Cannot import keys if the input is not an OpenPGP key\n");
           return;
         }
+        session_status_display_incoming_key_menu(status, stdout);
       }
 
       if ((rc = session_status_ingest_packet(status, packet))) {
@@ -1103,5 +1276,7 @@ int main(int argc, const char *argv[]) {
   gnutls_priority_deinit(priority_cache);
   gnutls_psk_free_server_credentials(creds);
   QRcode_free(qrcode);
+  if ((rc == uv_loop_close(&loop)))
+    fprintf(stderr, "uv_loop_close() returned (%d) %s\n", rc, uv_strerror(rc));
   return 0;
 }
