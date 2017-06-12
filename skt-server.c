@@ -152,12 +152,6 @@ int session_status_send_key(struct session_status *status, gpgme_key_t key) {
   }
   free(pattern);
 
-  /* FIXME: why do we need the separate newline? */
-  rc = gnutls_record_send(status->session, "\n", 1);
-  if (rc != 1) { /* FIXME: blocking */
-    fprintf(stderr, "failed to send final newline: (%d) %s\n", rc, gnutls_strerror(rc));
-    return -1;
-  }
   gpgme_data_release(data);
   return 0;
 }
