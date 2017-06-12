@@ -28,6 +28,9 @@ const char priority[] = "NORMAL:-CTYPE-ALL"
   ":-SIGN-ALL"
   ":-KX-ALL:+ECDHE-PSK:+DHE-PSK"
   ":-3DES-CBC:-CAMELLIA-128-CBC:-CAMELLIA-256-CBC";
+const char pgp_begin[] = "-----BEGIN PGP PRIVATE KEY BLOCK-----";
+const char pgp_end[] = "\n-----END PGP PRIVATE KEY BLOCK-----";
+
 
 #define PSK_BYTES 16
 
@@ -61,6 +64,8 @@ struct session_status {
   gpgme_ctx_t gpgctx;
   gpgme_ctx_t incoming;
   char *incomingdir;
+  gnutls_datum_t incomingkey;
+  size_t incomingkeylen;
   gpgme_key_t *keys;
   size_t num_keys;
   size_t keylist_offset;
@@ -82,6 +87,9 @@ void session_status_free(struct session_status *status) {
       gpgme_release(status->gpgctx);
     if (status->incoming)
       gpgme_release(status->incoming);
+    if (status->incomingkey.data) {
+      free(status->incomingkey.data);
+    }
     if (status->incomingdir) {
       /* FIXME: really tear down the ephemeral homedir */
       if (rmdir(status->incomingdir))
@@ -709,6 +717,97 @@ void session_status_release_all_gpg_keys(struct session_status *status) {
   }
 }
 
+/* appends SUFFIX to position POS in BASE, growing BASE if necessary */
+int append_data(gnutls_datum_t *base, const gnutls_datum_t *suffix, size_t pos) {
+  fprintf(stderr, "base->data: %p, suffix->size: %u, pos: %zu\n", base->data, suffix->size, pos);
+  size_t newlen = pos + suffix->size;
+  if (base->size < newlen) {
+    unsigned char *newdata = realloc(base->data, newlen);
+    if (!newdata)
+      return ENOMEM;
+    base->data = newdata;
+    base->size = newlen;
+  }
+  memcpy(base->data + pos, suffix->data, suffix->size);
+  return 0;
+}
+
+int session_status_ingest_key(struct session_status *status, unsigned char *ptr, size_t sz) {
+  return ENOSYS;
+}
+
+/* look through the incoming data stream and if it contains a key, try
+   to ingest it.  FIXME: it's a bit wasteful to perform this scan of
+   the whole buffer every time a packet comes in; should really be
+   done in true async form, with the state stored in status someplace. */
+int session_status_try_incoming_keys(struct session_status *status) {
+  unsigned char *key = status->incomingkey.data;
+  size_t sz = status->incomingkeylen;
+  size_t consumed = 0;
+  unsigned char *end;
+  int rc;
+  int ret = 0;
+
+  while (1) {
+    if (sz < sizeof(pgp_begin))
+      break; /* just not big enough yet */
+    if (memcmp(pgp_begin, key, sizeof(pgp_begin)-1))
+      return EINVAL; /* it's gotta start with the usual header */
+    if (!(key[sizeof(pgp_begin)-1] == '\r' || key[sizeof(pgp_begin)-1] == '\n'))
+      return EINVAL; /* needs a trailing newline, however that's formed */
+    
+    /* FIXME: ensure that we just get comments and headers between the
+       begin and end lines */
+    
+    end = memmem(key, sz, pgp_end, sizeof(pgp_end)-1);
+    if (end == NULL)
+      break; /* haven't reached the end yet */
+    size_t pos = end + (sizeof(pgp_end)-1) - key;
+    assert(pos <= sz);
+    if (pos == sz)
+      return 0; /* got everything but the final newline */
+    if (key[pos] == '\n') {
+      pos += 1;
+    } else if (key[pos] == '\r') {
+      if (pos+1 == sz)
+        return 0; /* got everything but the final newline in a CRLF format */
+      if (key[pos+1] == '\n')
+        pos += 2;
+      else
+        return EINVAL;
+    } else
+      return EINVAL;
+    /* at this point, POS points to the end of what we suspect to be an
+       OpenPGP transferable private key. */
+    if ((rc = session_status_ingest_key(status, key, pos))) {
+      ret = rc;
+    }
+    consumed += pos;
+    key += pos;
+    sz -= pos;
+  }
+  if (consumed) {
+    size_t leftovers = status->incomingkeylen - consumed;
+    if (leftovers)
+      memmove(status->incomingkey.data, status->incomingkey.data + consumed, leftovers);
+    status->incomingkeylen = leftovers;
+  }
+  return ret;
+}
+
+int session_status_ingest_packet(struct session_status *status, gnutls_packet_t packet) {
+  gnutls_datum_t data;
+  int rc;
+
+  assert(packet);
+  gnutls_packet_get(packet, &data, NULL);
+  if ((rc = append_data(&status->incomingkey, &data, status->incomingkeylen))) {
+    fprintf(stderr, "Failed to append data: (%d) %s\n", rc, strerror(rc));
+    return rc;
+  }
+  status->incomingkeylen += data.size;
+  return session_status_try_incoming_keys(status);
+}
 
 void session_status_read_cb(uv_stream_t* stream, ssize_t nread, const uv_buf_t* buf) {
   struct session_status *status = stream->data;
@@ -741,7 +840,7 @@ void session_status_read_cb(uv_stream_t* stream, ssize_t nread, const uv_buf_t* 
     assert(status->session);
     rc = gnutls_record_recv_packet(status->session, &packet);
     if (rc == GNUTLS_E_AGAIN)
-      return; /* we've read everything there is to read in this flight */
+      return;
     if (rc == 0) {
       /* This is EOF from the remote peer.  We'd like to handle a
          half-closed stream if we're the active peer */
@@ -775,29 +874,26 @@ void session_status_read_cb(uv_stream_t* stream, ssize_t nread, const uv_buf_t* 
         return;
       }
     } else {
-      gnutls_datum_t data;
-      size_t written = 0;
       if (status->active) {
+        gnutls_packet_deinit(packet);
         its_all_over(status, "We are the active sender, but the other side sent stuff\n");
         return;
       }
-      
+
       /* we're now in passive mode.  */
-      if (!status->incomingdir)
+      if (!status->incomingdir) {
         if (session_status_setup_incoming(status)) {
           its_all_over(status, "Cannot import keys if the input is not an OpenPGP key\n");
           return;
         }
-                                        
-      assert(packet);
-      gnutls_packet_get(packet, &data, NULL);
-      written = fwrite(data.data, data.size, 1, stdout);
-      
-      gnutls_packet_deinit(packet);
-      if (1 != written) {
-        its_all_over(status, "failed to write incoming record of size %d\n", data.size);
+      }
+
+      if ((rc = session_status_ingest_packet(status, packet))) {
+        gnutls_packet_deinit(packet);
+        its_all_over(status, "failed to ingest the packet: (%d) %s\n", rc, strerror(rc));
         return;
       }
+      gnutls_packet_deinit(packet);
     }
   }
 }
