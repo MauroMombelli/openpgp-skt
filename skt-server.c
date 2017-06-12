@@ -30,7 +30,6 @@ const char priority[] = "NORMAL:-CTYPE-ALL"
   ":-3DES-CBC:-CAMELLIA-128-CBC:-CAMELLIA-256-CBC";
 
 #define PSK_BYTES 16
-#define LOG_LEVEL 9
 
 struct session_status;
 
@@ -72,6 +71,7 @@ struct session_status {
   bool handshake_done;
   bool active;
   uv_tty_t input;
+  int log_level;
 };
 
 
@@ -108,7 +108,7 @@ void input_alloc_cb(uv_handle_t* handle, size_t suggested_size, uv_buf_t* buf) {
 
 ssize_t session_status_gpgme_write(void *h, const void *buf, size_t sz) {
   struct session_status *status = h;
-  if (LOG_LEVEL > 3)
+  if (status->log_level > 3)
     fprintf(stderr, "got %zd octets of data from gpgme (%p)\n", sz, (void*)status);
   int rc = gnutls_record_send(status->session, buf, sz); /* FIXME: blocking */
   if (rc < 0) {
@@ -174,7 +174,7 @@ void input_read_cb(uv_stream_t* stream, ssize_t nread, const uv_buf_t* buf) {
     } else if (tolower(c) == 'q' || c == 0x1B /* ESC */) {
       its_all_over(status, "quitting\n");
     } else if (status->incomingdir) {
-      if (LOG_LEVEL > 2)
+      if (status->log_level > 2)
         fprintf(stderr, "In passive mode.  Cannot send keys.  Quit and reconnect to take the active role.\n");
     } else if (c == '0') {
       fprintf(stderr, "FIXME: sending a file from active mode is not yet implemented!\n");
@@ -189,7 +189,7 @@ void input_read_cb(uv_stream_t* stream, ssize_t nread, const uv_buf_t* buf) {
         status->keylist_offset = 0;
       session_status_display_key_menu(status, stdout);
     } else {
-      if (LOG_LEVEL > 2)
+      if (status->log_level > 2)
         fprintf(stderr, "Got %d (0x%02x) '%.1s'\n", buf->base[0], buf->base[0], isprint(buf->base[0])? buf->base : "_");
     }
   } else if (nread < 0) {
@@ -270,7 +270,7 @@ int session_status_setup_incoming(struct session_status *status) {
   return -1;
 }
 
-struct session_status * session_status_new(uv_loop_t *loop) {
+struct session_status * session_status_new(uv_loop_t *loop, int log_level) {
   struct session_status *status = calloc(1, sizeof(struct session_status));
   size_t pskhexsz = sizeof(status->pskhex);
   gpgme_error_t gerr = GPG_ERR_NO_ERROR;
@@ -278,6 +278,7 @@ struct session_status * session_status_new(uv_loop_t *loop) {
   
   if (status) {
     status->loop = loop;
+    status->log_level = log_level;
     status->sa_serv_storage_sz = sizeof (status->sa_serv_storage);
     status->sa_cli_storage_sz = sizeof (status->sa_cli_storage);
 
@@ -346,17 +347,17 @@ int session_status_choose_address(struct session_status* status) {
       strcpy(addrstring, "<no address>");
     }
     if (ifa->ifa_flags & IFF_LOOPBACK) {
-      if (LOG_LEVEL > 2)
+      if (status->log_level > 2)
         fprintf(stderr, "skipping %s because it is loopback\n", ifa->ifa_name);
       continue;
     }
     if (!(ifa->ifa_flags & IFF_UP)) {
-      if (LOG_LEVEL > 2)
+      if (status->log_level > 2)
         fprintf(stderr, "skipping %s because it is not up\n", ifa->ifa_name);
       continue;
     }
     if (!skip) {
-      if (LOG_LEVEL > 2)
+      if (status->log_level > 2)
         fprintf(stdout, "%s %s: %s (flags: 0x%x)\n", myaddr==NULL?"*":" ", ifa->ifa_name, addrstring, ifa->ifa_flags);
       /* FIXME: we're just taking the first up, non-loopback address */
       /* be cleverer about prefering wifi, preferring link-local addresses, and RFC1918 addressses. */
@@ -414,7 +415,7 @@ int get_psk_creds(gnutls_session_t session, const char* username, gnutls_datum_t
   struct session_status *status;
   status = gnutls_session_get_ptr(session);
   
-  if (LOG_LEVEL > 2)
+  if (status->log_level > 2)
     fprintf(stderr, "sent username: %s, PSK: %s\n",
             username, /* dangerous: random bytes from the network! */
             status->pskhex); 
@@ -726,7 +727,7 @@ void session_status_read_cb(uv_stream_t* stream, ssize_t nread, const uv_buf_t* 
       break;
     case GNUTLS_E_INTERRUPTED:
     case GNUTLS_E_AGAIN:
-      if (LOG_LEVEL > 3)
+      if (status->log_level > 3)
         fprintf(stderr, "gnutls_handshake() got (%d) %s\n", rc, gnutls_strerror(rc));
       break;
     case GNUTLS_E_SUCCESS:
@@ -746,7 +747,7 @@ void session_status_read_cb(uv_stream_t* stream, ssize_t nread, const uv_buf_t* 
          half-closed stream if we're the active peer */
       assert(packet == NULL);
       if (status->active) {
-        if (LOG_LEVEL > 0) 
+        if (status->log_level > 0) 
           fprintf(stderr, "passive peer closed its side of the connection.\n");
       } else {
         if (status->incomingdir) {
@@ -854,9 +855,13 @@ int main(int argc, const char *argv[]) {
   int urllen;
   QRcode *qrcode = NULL;
   FILE * inkey = NULL;
+  const char *ll;
+  int log_level;
 
+  ll = getenv("LOG_LEVEL");
+  log_level = ll ? atoi(ll) : 0;
   gpgme_check_version (NULL);
-  gnutls_global_set_log_level(LOG_LEVEL);
+  gnutls_global_set_log_level(log_level);
   gnutls_global_set_log_function(skt_log);
   if ((rc = uv_loop_init(&loop))) {
     fprintf(stderr, "failed to init uv_loop: (%d) %s\n", rc, uv_strerror(rc));
@@ -874,7 +879,7 @@ int main(int argc, const char *argv[]) {
     }
   }
 
-  status = session_status_new(&loop);
+  status = session_status_new(&loop, log_level);
   if (!status) {
     fprintf(stderr, "Failed to initialize status object\n");
     return -1;
@@ -949,9 +954,9 @@ int main(int argc, const char *argv[]) {
   }
 
   /* for test purposes... */
-  if (LOG_LEVEL > 0)
+  if (status->log_level > 0)
     fprintf(stdout, "gnutls-cli --debug %d --priority %s --port %d --pskusername %s --pskkey %s %s\n",
-            LOG_LEVEL, priority, status->port, psk_id_hint, status->pskhex, status->addrp);
+            status->log_level, priority, status->port, psk_id_hint, status->pskhex, status->addrp);
 
   if ((rc = uv_run(&loop, UV_RUN_DEFAULT))) {
     while ((rc = uv_run(&loop, UV_RUN_ONCE))) {
@@ -963,7 +968,7 @@ int main(int argc, const char *argv[]) {
   if (inkey) {
     /* FIXME: send key */
     char data[65536];
-    if (LOG_LEVEL > 3)
+    if (status->log_level > 3)
       fprintf(stderr, "trying to write %s to client\n", (stdin == inkey) ? "standard input" : argv[1]);
 
     /* read from inkey, send to gnutls */
@@ -974,7 +979,7 @@ int main(int argc, const char *argv[]) {
         fprintf(stderr, "Error reading from input\n");
         return -1;
       } else {
-        if (LOG_LEVEL > 3)
+        if (status->log_level > 3)
           fprintf(stderr, "trying to write %zd octets to client\n", r);
         while (r) {
           rc = GNUTLS_E_AGAIN;
