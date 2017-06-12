@@ -735,10 +735,12 @@ void session_status_read_cb(uv_stream_t* stream, ssize_t nread, const uv_buf_t* 
     default:
       its_all_over(status, "gnutls_handshake() got (%d) %s, fatal\n", rc, gnutls_strerror(rc));
     }
-  } else {
+  } else while (1) {
     gnutls_packet_t packet = NULL;
     assert(status->session);
     rc = gnutls_record_recv_packet(status->session, &packet);
+    if (rc == GNUTLS_E_AGAIN)
+      return; /* we've read everything there is to read in this flight */
     if (rc == 0) {
       /* This is EOF from the remote peer.  We'd like to handle a
          half-closed stream if we're the active peer */
@@ -754,19 +756,22 @@ void session_status_read_cb(uv_stream_t* stream, ssize_t nread, const uv_buf_t* 
              on. */
           if (!session_status_close_tls(status)) {
             fprintf(stderr, "Failed to close the TLS session!\n");
+            return;
           }
         } else {
           its_all_over(status, "TLS session closed with nothing transmitted from either side!\n");
+          return;
         }
       }
     } else if (rc < 0) {
       if (packet)
         gnutls_packet_deinit(packet);
-      if (rc == GNUTLS_E_INTERRUPTED || rc == GNUTLS_E_AGAIN) {
+      if (rc == GNUTLS_E_INTERRUPTED) {
         fprintf(stderr, "gnutls_record_recv_packet returned (%d) %s\n", rc, gnutls_strerror(rc));
       } else {
         /* this is an error */
         its_all_over(status, "Got an error in gnutls_record_recv_packet: (%d) %s\n", rc, gnutls_strerror(rc));
+        return;
       }
     } else {
       gnutls_datum_t data;
@@ -778,8 +783,10 @@ void session_status_read_cb(uv_stream_t* stream, ssize_t nread, const uv_buf_t* 
       
       /* we're now in passive mode.  */
       if (!status->incomingdir)
-        if (session_status_setup_incoming(status))
+        if (session_status_setup_incoming(status)) {
           its_all_over(status, "Cannot import keys if the input is not an OpenPGP key\n");
+          return;
+        }
                                         
       assert(packet);
       gnutls_packet_get(packet, &data, NULL);
@@ -788,6 +795,7 @@ void session_status_read_cb(uv_stream_t* stream, ssize_t nread, const uv_buf_t* 
       gnutls_packet_deinit(packet);
       if (1 != written) {
         its_all_over(status, "failed to write incoming record of size %d\n", data.size);
+        return;
       }
     }
   }
