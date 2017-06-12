@@ -748,9 +748,12 @@ int session_status_try_incoming_keys(struct session_status *status) {
   int rc;
   int ret = 0;
 
-  while (1) {
-    if (sz < sizeof(pgp_begin))
+  while (sz > 0) {
+    if (sz < sizeof(pgp_begin)) {
+      if (memcmp(pgp_begin, key, sz))
+        return EINVAL; /* even the beginning doesn't match the expected first line */
       break; /* just not big enough yet */
+    }
     if (memcmp(pgp_begin, key, sizeof(pgp_begin)-1))
       return EINVAL; /* it's gotta start with the usual header */
     if (!(key[sizeof(pgp_begin)-1] == '\r' || key[sizeof(pgp_begin)-1] == '\n'))
