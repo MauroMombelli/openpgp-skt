@@ -30,7 +30,7 @@ const char priority[] = "NORMAL:-CTYPE-ALL"
   ":-3DES-CBC:-CAMELLIA-128-CBC:-CAMELLIA-256-CBC";
 
 #define PSK_BYTES 16
-#define LOG_LEVEL 1
+#define LOG_LEVEL 9
 
 struct session_status;
 
@@ -41,6 +41,8 @@ void session_status_connect(uv_stream_t* server, int status);
 int session_status_gather_secret_keys(struct session_status *status);
 void session_status_release_all_gpg_keys(struct session_status *status);
 void session_status_display_key_menu(struct session_status *status, FILE *f);
+int session_status_close_tls(struct session_status *status);
+
 
 struct session_status {
   uv_loop_t *loop;
@@ -58,6 +60,8 @@ struct session_status {
   int sa_cli_storage_sz;
   gnutls_session_t session;
   gpgme_ctx_t gpgctx;
+  gpgme_ctx_t incoming;
+  char *incomingdir;
   gpgme_key_t *keys;
   size_t num_keys;
   size_t keylist_offset;
@@ -66,6 +70,7 @@ struct session_status {
   size_t start;
   size_t end;
   bool handshake_done;
+  bool active;
   uv_tty_t input;
 };
 
@@ -75,9 +80,18 @@ void session_status_free(struct session_status *status) {
     session_status_release_all_gpg_keys(status);
     if (status->gpgctx)
       gpgme_release(status->gpgctx);
+    if (status->incoming)
+      gpgme_release(status->incoming);
+    if (status->incomingdir) {
+      /* FIXME: really tear down the ephemeral homedir */
+      if (rmdir(status->incomingdir))
+        fprintf(stderr, "failed to rmdir('%s'): (%d) %s\n", status->incomingdir, errno, strerror(errno));
+
+      /* FIXME: should we also try to kill all running daemons?*/
+      free(status->incomingdir);
+    }
     if (status->session) {
-      gnutls_bye(status->session, GNUTLS_SHUT_RDWR);
-      gnutls_deinit(status->session);
+      session_status_close_tls(status);
     }
     if (status->ifap)
       freeifaddrs(status->ifap);
@@ -124,15 +138,8 @@ int session_status_send_key(struct session_status *status, gpgme_key_t key) {
   gpgme_export_mode_t mode = GPGME_EXPORT_MODE_MINIMAL | GPGME_EXPORT_MODE_SECRET;
   char *pattern = NULL;
   gpgme_data_t data = NULL;
-  
-  /* stop receiving stuff from the TLS session */
-  /* FIXME: this means that we don't learn if the session has gone
-     away; we should keep reading from it but give an error if
-     anything consequential shows */
-  if ((rc = uv_read_stop((uv_stream_t*)(&status->accepted_socket)))) {
-    fprintf(stderr, "failed to stop reading from the TLS session: (%d) %s\n", rc, uv_strerror(rc));
-    /* FIXME: should we fail hard here?  */
-  }
+
+  status->active = true;
   gpgme_set_armor(status->gpgctx, 1);
   rc = asprintf(&pattern, "0x%s", key->fpr);
   if (rc == -1) {
@@ -164,8 +171,11 @@ void input_read_cb(uv_stream_t* stream, ssize_t nread, const uv_buf_t* buf) {
       its_all_over(status, "got ctrl-c\n");
     } else if (c == 4) {
       its_all_over(status, "got ctrl-d\n");
-    } else if (tolower(c) == 'q') {
+    } else if (tolower(c) == 'q' || c == 0x1B /* ESC */) {
       its_all_over(status, "quitting\n");
+    } else if (status->incomingdir) {
+      if (LOG_LEVEL > 2)
+        fprintf(stderr, "In passive mode.  Cannot send keys.  Quit and reconnect to take the active role.\n");
     } else if (c == '0') {
       fprintf(stderr, "FIXME: sending a file from active mode is not yet implemented!\n");
     } else if (c >= '1' && c <= '8') {
@@ -196,6 +206,70 @@ void input_close_cb(uv_handle_t *handle) {
     fprintf(stderr, "failed to switch input back to normal mode: (%d) %s\n", rc, uv_strerror(rc));
 }
 
+int session_status_setup_incoming(struct session_status *status) {
+  gpgme_error_t gerr;
+  int rc;
+  char *xdg = getenv("XDG_RUNTIME_DIR");
+  bool xdgf = false;
+
+  assert(status->incoming == NULL);
+  
+  if (xdg != NULL) {
+    rc = asprintf(&xdg, "/run/user/%d", getuid());
+    if (rc == -1) {
+      fprintf(stderr, "failed to guess user ID during ephemeral GnuPG setup.\r\n");
+      return -1;
+    }
+    xdgf = true;
+  }
+
+  if (F_OK != access(xdg, W_OK)) {
+    fprintf(stderr, "We don't have write access to '%s' for GnuPG ephemeral dir, falling back...\n", xdg);
+    free(xdg);
+    xdgf = false;
+    xdg = getenv("TMPDIR");
+    if (xdg == NULL || (F_OK != access(xdg, W_OK))) {
+      if (xdg != NULL)
+        fprintf(stderr, "We don't have write access to $TMPDIR ('%s') for GnuPG ephemeral dir, falling back to /tmp\n", xdg);
+      xdg = "/tmp";
+    }
+  }
+       
+  rc = asprintf(&status->incomingdir, "%s/skt-server.XXXXXX", xdg);
+  if (rc == -1) {
+    fprintf(stderr, "Failed to allocate ephemeral GnuPG directory name in %s\n", xdg);
+    goto fail;
+  }
+  if (NULL == mkdtemp(status->incomingdir)) {
+    fprintf(stderr, "failed to generate an ephemeral GnuPG homedir from template '%s'\n", status->incomingdir);
+    free(status->incomingdir);
+    status->incomingdir = NULL;
+    goto fail;
+  }
+  
+  if ((gerr = gpgme_new(&status->incoming))) {
+    fprintf(stderr, "gpgme_new failed when setting up ephemeral incoming directory: (%d), %s\n",
+            gerr, gpgme_strerror(gerr));
+    goto fail;
+  }
+  if ((gerr = gpgme_ctx_set_engine_info(status->incoming, GPGME_PROTOCOL_OpenPGP, NULL, status->incomingdir))) {
+    fprintf(stderr, "gpgme_ctx_set_engine_info failed for ephemeral homedir %s: (%d), %s\n", status->incomingdir, gerr, gpgme_strerror(gerr));
+    goto fail;
+  }
+
+  return 0;
+ fail:
+  if (xdgf)
+    free(xdg);
+  if (status->incomingdir) {
+    if (rmdir(status->incomingdir))
+      fprintf(stderr, "failed to rmdir('%s'): (%d) %s\n", status->incomingdir, errno, strerror(errno));
+    free(status->incomingdir);
+    status->incomingdir = NULL;
+  }
+  return -1;
+}
+
 struct session_status * session_status_new(uv_loop_t *loop) {
   struct session_status *status = calloc(1, sizeof(struct session_status));
   size_t pskhexsz = sizeof(status->pskhex);
@@ -215,7 +289,7 @@ struct session_status * session_status_new(uv_loop_t *loop) {
       fprintf(stderr, "gpgme_ctx_set_engine_info failed: (%d), %s\n", gerr, gpgme_strerror(gerr));
       goto fail;
     }
-         
+
     /* choose random number */  
     if ((rc = gnutls_key_generate(&status->psk, PSK_BYTES))) {
       fprintf(stderr, "failed to get randomness: (%d) %s\n", rc, gnutls_strerror(rc));
@@ -451,6 +525,22 @@ int print_address_name(struct sockaddr_storage *addr, char *paddr, size_t paddrs
   return 0;
 }
 
+int session_status_close_tls(struct session_status *status) {
+  int rc;
+  assert(status->session);
+  if ((rc = gnutls_bye(status->session, GNUTLS_SHUT_RDWR))) {
+    fprintf(stderr, "gnutls_bye got error (%d) %s\n", rc, gnutls_strerror(rc));
+    return -1;
+  }
+  gnutls_deinit(status->session);
+  status->session = NULL;
+  if ((rc = uv_read_stop((uv_stream_t*)&status->accepted_socket))) {
+    fprintf(stderr, "failed to stop reading the TLS stream (%d) %s\n", rc, uv_strerror(rc));
+    return -1;
+  }    
+  return 0;
+}
+
 void its_all_over(struct session_status *status, const char *fmt, ...) {
   va_list ap;
   int rc;
@@ -459,9 +549,7 @@ void its_all_over(struct session_status *status, const char *fmt, ...) {
   va_end(ap);
   /* FIXME: how to tear it all down? */
   if (status->session) {
-    if ((rc = gnutls_bye(status->session, GNUTLS_SHUT_RDWR))) {
-      fprintf(stderr, "gnutls_bye got error (%d) %s\n", rc, gnutls_strerror(rc));
-    }
+    session_status_close_tls(status);
   }
   if (status->input.data && !uv_is_closing((uv_handle_t*)(&status->input))) {
     if ((rc = uv_tty_reset_mode()))
@@ -638,7 +726,8 @@ void session_status_read_cb(uv_stream_t* stream, ssize_t nread, const uv_buf_t* 
       break;
     case GNUTLS_E_INTERRUPTED:
     case GNUTLS_E_AGAIN:
-      fprintf(stderr, "gnutls_handshake() got (%d) %s\n", rc, gnutls_strerror(rc));
+      if (LOG_LEVEL > 3)
+        fprintf(stderr, "gnutls_handshake() got (%d) %s\n", rc, gnutls_strerror(rc));
       break;
     case GNUTLS_E_SUCCESS:
       session_status_handshake_done(status);
@@ -648,12 +737,28 @@ void session_status_read_cb(uv_stream_t* stream, ssize_t nread, const uv_buf_t* 
     }
   } else {
     gnutls_packet_t packet = NULL;
-    /* FIXME: we should fail if we've already decided that we're in active mode */
+    assert(status->session);
     rc = gnutls_record_recv_packet(status->session, &packet);
     if (rc == 0) {
-      /* FIXME: this is EOF */
+      /* This is EOF from the remote peer.  We'd like to handle a
+         half-closed stream if we're the active peer */
       assert(packet == NULL);
-      its_all_over(status, "done!\n");
+      if (status->active) {
+        if (LOG_LEVEL > 0) 
+          fprintf(stderr, "passive peer closed its side of the connection.\n");
+      } else {
+        if (status->incomingdir) {
+          /* Now we've loaded as many of the keys as we will get.  We
+             should now be in a mode where we ask the user to import
+             them.  So we just need to close the TLS session and carry
+             on. */
+          if (!session_status_close_tls(status)) {
+            fprintf(stderr, "Failed to close the TLS session!\n");
+          }
+        } else {
+          its_all_over(status, "TLS session closed with nothing transmitted from either side!\n");
+        }
+      }
     } else if (rc < 0) {
       if (packet)
         gnutls_packet_deinit(packet);
@@ -664,11 +769,18 @@ void session_status_read_cb(uv_stream_t* stream, ssize_t nread, const uv_buf_t* 
         its_all_over(status, "Got an error in gnutls_record_recv_packet: (%d) %s\n", rc, gnutls_strerror(rc));
       }
     } else {
-      /* we're now in passive mode.  */
-      /* FIXME: we should terminate the choice for active some number
-       of bytes was read */
       gnutls_datum_t data;
       size_t written = 0;
+      if (status->active) {
+        its_all_over(status, "We are the active sender, but the other side sent stuff\n");
+        return;
+      }
+      
+      /* we're now in passive mode.  */
+      if (!status->incomingdir)
+        if (session_status_setup_incoming(status))
+          its_all_over(status, "Cannot import keys if the input is not an OpenPGP key\n");
+                                        
       assert(packet);
       gnutls_packet_get(packet, &data, NULL);
       written = fwrite(data.data, data.size, 1, stdout);
