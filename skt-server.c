@@ -190,15 +190,38 @@ ssize_t session_status_gpgme_write(void *h, const void *buf, size_t sz) {
 
 int session_status_import_incoming_key(struct session_status *status, gpgme_key_t k) {
   gpgme_error_t gerr;
-  if (status->log_level > 2)
+  gpgme_data_t d;
+  char *pattern = NULL;
+  int rc;
+  gpgme_export_mode_t mode = GPGME_EXPORT_MODE_SECRET;
+
+  if (status->log_level > 0)
     fprintf(stderr, "Importing key %s\n", k->fpr);
 
-  gpgme_key_t keys[2];
-  keys[0] = k;
-  keys[1] = NULL;
+  if ((gerr = gpgme_data_new(&d))) {
+    fprintf(stderr, "failed to initialize new gpgme data. (%d) %s\n", gerr, gpgme_strerror(gerr));
+    return ENOMEM;
+  }
+  
+  rc = asprintf(&pattern, "0x%s", k->fpr);
+  if (rc == -1) {
+    gpgme_data_release(d);
+    return rc;
+  }
+  gpgme_set_armor(status->incoming, 1);
 
-  if ((gerr = gpgme_op_import_keys(status->gpgctx, keys))) {
-    fprintf(stderr, "gpgme_op_import_keys() failed with this gpg error: (%d) %s\n",
+  gerr = gpgme_op_export(status->incoming, pattern, mode, d);
+  free(pattern);
+  if (gerr) {
+    gpgme_data_release(d);
+    fprintf(stderr, "gpgme_op_export() failed with this error: (%d) %s\n", gerr, gpgme_strerror(gerr));
+    return EIO;
+  }
+
+  gerr = gpgme_op_import(status->gpgctx, d);
+  gpgme_data_release(d);
+  if (gerr) {
+    fprintf(stderr, "gpgme_op_import() failed with this error: (%d) %s\n",
             gerr, gpgme_strerror(gerr));
     return EIO;
   }
