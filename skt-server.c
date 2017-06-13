@@ -51,7 +51,7 @@ void session_status_release_all_gpg_keys(struct session_status *status);
 void session_status_display_key_menu(struct session_status *status, FILE *f);
 void session_status_display_incoming_key_menu(struct session_status *status, FILE *f);
 int session_status_close_tls(struct session_status *status);
-void session_status_import_incoming_key(struct session_status *status, gpgme_key_t k);
+int session_status_import_incoming_key(struct session_status *status, gpgme_key_t k);
 
 
 struct session_status {
@@ -151,12 +151,46 @@ ssize_t session_status_gpgme_write(void *h, const void *buf, size_t sz) {
   return sz;
 }
 
-/* FIXME: should be const, but gpgme is cranky */
-struct gpgme_data_cbs gpg_callbacks = { .write = session_status_gpgme_write };
 
 int session_status_import_incoming_key(struct session_status *status, gpgme_key_t k) {
-  /* FIXME: this needs to be finished! */
+  gpgme_error_t gerr;
+  if (status->log_level > 2)
+    fprintf(stderr, "Importing key %s\n", k->fpr);
+
+  gpgme_key_t keys[2];
+  keys[0] = k;
+  keys[1] = NULL;
+
+  if ((gerr = gpgme_op_import_keys(status->gpgctx, keys))) {
+    fprintf(stderr, "gpgme_op_import_keys() failed with this gpg error: (%d) %s\n",
+            gerr, gpgme_strerror(gerr));
+    return EIO;
+  }
+  gpgme_import_result_t result = gpgme_op_import_result(status->gpgctx);
+  if (!result) {
+    fprintf(stderr, "failure to get gpgme_op_import_result().\n");
+    return EIO;
+  }
+  bool found = false;
+  for (gpgme_import_status_t s = result->imports; s; s = s->next) {
+    if (!strcmp(s->fpr, k->fpr)) {
+      found = true;
+    } else {
+      fprintf(stderr, "found surprising other fingerprint (%s) during attempt to import %s\n",
+              s->fpr, k->fpr);
+    }
+  }
+  if (!found) {
+    fprintf(stderr, "Did not see expected fingerprint %s during import\n", k->fpr);
+    return EIO;
+  }
+    
+  return 0;
 }
+
+
+/* FIXME: should be const, but gpgme is cranky */
+struct gpgme_data_cbs gpg_callbacks = { .write = session_status_gpgme_write };
 
 int session_status_send_key(struct session_status *status, gpgme_key_t key) {
   int rc = 0;
@@ -208,6 +242,7 @@ void quit(struct session_status *status) {
 
 void input_read_cb(uv_stream_t* stream, ssize_t nread, const uv_buf_t* buf) {
   struct session_status *status = stream->data;
+  int rc;
   if (nread > 0) {
     int c = buf->base[0];
     if (c == 3) {
@@ -223,15 +258,15 @@ void input_read_cb(uv_stream_t* stream, ssize_t nread, const uv_buf_t* buf) {
         fprintf(stderr, "The other device is already sending keys.\nQuit and reconnect to push keys the other way.\n");
       } else if (c >= 'a' && c <= ('a' + 7)) {
         int x = (c - 'a') + status->inkeylist_offset;
-        session_status_import_incoming_key(status, status->inkeys[x].key);
+        if ((rc = session_status_import_incoming_key(status, status->inkeys[x].key)))
+          fprintf(stderr, "failed to import key: (%d) %s\n", rc, strerror(rc));
       } else if (c == 'n') {
-      if (status->num_inkeys < 9)
-        fprintf(stderr, "No more keys to display\n");
-      status->inkeylist_offset += 8;
-      if (status->inkeylist_offset >= status->num_inkeys)
-        status->inkeylist_offset = 0;
-      session_status_display_incoming_key_menu(status, stdout);
-
+        if (status->num_inkeys < 9)
+          fprintf(stderr, "No more keys to display\n");
+        status->inkeylist_offset += 8;
+        if (status->inkeylist_offset >= status->num_inkeys)
+          status->inkeylist_offset = 0;
+        session_status_display_incoming_key_menu(status, stdout);
       }
     } else if (c == '0') {
       fprintf(stderr, "FIXME: sending a file from active mode is not yet implemented!\n");
