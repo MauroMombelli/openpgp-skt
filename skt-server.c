@@ -52,7 +52,7 @@ void session_status_display_key_menu(struct session_status *status, FILE *f);
 void session_status_display_incoming_key_menu(struct session_status *status, FILE *f);
 int session_status_close_tls(struct session_status *status);
 int session_status_import_incoming_key(struct session_status *status, gpgme_key_t k);
-
+int recursive_unlink(const char *pathname, int log_level);
 
 struct session_status {
   uv_loop_t *loop;
@@ -106,8 +106,8 @@ void session_status_free(struct session_status *status) {
     }
     if (status->incomingdir) {
       /* FIXME: really tear down the ephemeral homedir */
-      if (rmdir(status->incomingdir))
-        fprintf(stderr, "failed to rmdir('%s'): (%d) %s\n", status->incomingdir, errno, strerror(errno));
+      if (recursive_unlink(status->incomingdir, status->log_level))
+        fprintf(stderr, "failed to recursively remove ('%s'): (%d) %s\n", status->incomingdir, errno, strerror(errno));
 
       /* FIXME: should we also try to kill all running daemons?*/
       free(status->incomingdir);
@@ -121,6 +121,42 @@ void session_status_free(struct session_status *status) {
   }
 }
 
+
+int recursive_unlink(const char *path, int log_level) {
+  int rc;
+  errno = 0;
+  DIR *d = opendir(path);
+  if (d == NULL)
+    return errno;
+  struct dirent *de = NULL;
+  while ((de = readdir(d))) {
+    /* ignore . and .. */
+    if (de->d_name[0] == '.' &&
+        (de->d_name[1] == '\0' ||
+         (de->d_name[1] == '.' && de->d_name[2] == '\0')))
+      continue;
+    if (log_level > 2)
+      fprintf(stderr, "unlinking %s/%s\n", path, de->d_name);
+    if (de->d_type == DT_DIR) {
+      char *child = NULL;
+      rc = asprintf(&child, "%s/%s", path, de->d_name);
+      if (rc == -1)
+        return ENOMEM;
+      rc = recursive_unlink(child, log_level);
+      free(child);
+      if (rc)
+        return rc;
+    } else {
+      rc = unlinkat(dirfd(d), de->d_name, 0);
+      if (rc) {
+        fprintf(stderr, "unlinkat(\"%s\", \"%s\", 0) failed: (%d) %s\n",
+                path, de->d_name, rc, strerror(rc));
+        return rc;
+      }
+    }
+  }
+  return rmdir(path);
+}
 
 void input_alloc_cb(uv_handle_t* handle, size_t suggested_size, uv_buf_t* buf) {
   /*  struct session_status *status = handle->data; */
