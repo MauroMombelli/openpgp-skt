@@ -190,36 +190,55 @@ ssize_t session_status_gpgme_write(void *h, const void *buf, size_t sz) {
 
 int session_status_import_incoming_key(struct session_status *status, gpgme_key_t k) {
   gpgme_error_t gerr;
-  gpgme_data_t d;
+  gpgme_data_t d[2];
   char *pattern = NULL;
   int rc;
+  int fds[2];
   gpgme_export_mode_t mode = GPGME_EXPORT_MODE_SECRET;
 
   if (status->log_level > 0)
     fprintf(stderr, "Importing key %s\n", k->fpr);
 
-  if ((gerr = gpgme_data_new(&d))) {
-    fprintf(stderr, "failed to initialize new gpgme data. (%d) %s\n", gerr, gpgme_strerror(gerr));
-    return ENOMEM;
+  if (pipe2(fds, O_CLOEXEC)) {
+    fprintf(stderr, "Failed to create pipe: (%d) %s\n", errno, strerror(errno));
+    return -1;
+  }
+  /* FIXME: these uses of GnuPG are serialized, but they should be
+     parallelized at least -- there's no reason to wait for the export
+     to complete to launch the import.  Even better would be to make
+     them entirely non-blocking, of course */
+  for (int ix = 0; ix < 2; ix++) {
+    if ((gerr = gpgme_data_new_from_fd(&d[ix], fds[ix]))) {
+      fprintf(stderr, "failed to initialize new gpgme data[%d]. (%d) %s\n",
+              ix, gerr, gpgme_strerror(gerr));
+      return ENOMEM;
+    }
   }
   
   rc = asprintf(&pattern, "0x%s", k->fpr);
   if (rc == -1) {
-    gpgme_data_release(d);
+    for (int ix = 0; ix < 2; ix++) {
+      gpgme_data_release(d[ix]);
+      close(fds[ix]);
+    }
     return rc;
   }
   gpgme_set_armor(status->incoming, 1);
 
-  gerr = gpgme_op_export(status->incoming, pattern, mode, d);
+  gerr = gpgme_op_export(status->incoming, pattern, mode, d[1]);
+  gpgme_data_release(d[1]);
+  close(fds[1]);
   free(pattern);
   if (gerr) {
-    gpgme_data_release(d);
-    fprintf(stderr, "gpgme_op_export() failed with this error: (%d) %s\n", gerr, gpgme_strerror(gerr));
+    gpgme_data_release(d[0]);
+    close(fds[0]);
+    fprintf(stderr, "gpgme_op_export_start() failed with this error: (%d) %s\n", gerr, gpgme_strerror(gerr));
     return EIO;
   }
 
-  gerr = gpgme_op_import(status->gpgctx, d);
-  gpgme_data_release(d);
+  gerr = gpgme_op_import(status->gpgctx, d[0]);
+  gpgme_data_release(d[0]);
+  close(fds[0]);
   if (gerr) {
     fprintf(stderr, "gpgme_op_import() failed with this error: (%d) %s\n",
             gerr, gpgme_strerror(gerr));

@@ -4,14 +4,13 @@ openpgp-skt
 https://pad.stratum0.org/p/openpgp-skt
 
 TODO:
-
- * integrate with gpgme just input needed): import to ephemeral
-   homedir, examine, then prompt the user whether to import it or now.
-
- * if we are going to send the double newlines, cork and uncork gnutls
-   before sending the newline.  this also means implementing
-   gnutls_transport_set_push_function()
-
  * allow selection of IP address (and network interface)
 
+ * hint at wifi SSID somehow?
+
  * improve visual effects for UI (e.g. clear the terminal before/after)
+
+ * abstract out selecting from a list of keys; it is a very similar
+   workflow for imported keys as for selecting keys to export.
+
+ * add zbarcam-style client work.
