@@ -498,11 +498,14 @@ skt_st * skt_session_new(uv_loop_t *loop, int log_level) {
 
 int skt_session_choose_address(skt_st* skt) {
   struct ifaddrs *ifa;
-  struct sockaddr *myaddr = NULL;
-  int myfamily = 0;
-  bool has_essid = false;
   struct wireless_config cfg;
-  char essid[sizeof(cfg.essid)];
+  struct {
+    int myfamily;
+    struct sockaddr *myaddr;
+    bool has_essid;
+    bool is_wifi;
+    char essid[sizeof(cfg.essid)];
+  } selected = { .myfamily = 0 };
   int rc;
   /*  int optval = 1; */
   
@@ -516,6 +519,7 @@ int skt_session_choose_address(skt_st* skt) {
     char addrstring[INET6_ADDRSTRLEN];
     bool skip = false;
     int family = 0;
+    bool is_wifi = false;
     
     if (ifa->ifa_addr) {
       family = ((struct sockaddr_storage*)(ifa->ifa_addr))->ss_family;
@@ -554,6 +558,7 @@ int skt_session_choose_address(skt_st* skt) {
             fprintf(stderr, "failed to get wireless info: (%d) %s\n", errno, strerror(errno));
           }
         } else {
+          is_wifi = true;
           if (cfg.has_essid) {
             if (cfg.essid_len >= sizeof(cfg.essid)) {
               fprintf(stderr, "essid is longer (%d octets) than we can handle (%zd octets)\n",
@@ -581,28 +586,27 @@ int skt_session_choose_address(skt_st* skt) {
           }
         }
       }
-      if (skt->log_level > 2)
-        fprintf(stdout, "%s %s: %s (flags: 0x%x)\n", myaddr==NULL?"*":" ", ifa->ifa_name, addrstring, ifa->ifa_flags);
       /* if a wifi NIC is up and has a printable ESSID, we'll take it.
          Otherwise, we will just take the first up, non-loopback address */
       /* FIXME: be cleverer about preferring link-local addresses, and RFC1918 addressses. */
-      if (myaddr == NULL) {
-        myfamily = family;
-        myaddr = ifa->ifa_addr;
+      bool takeit = selected.myaddr == NULL ||
+        (is_wifi && (!selected.is_wifi ||
+                     (essid_ok && !selected.has_essid)));
+      if (skt->log_level > 2)
+        fprintf(stdout, "%s %s: %s (flags: 0x%x)\n", takeit?"*":" ", ifa->ifa_name, addrstring, ifa->ifa_flags);
+      if (takeit) {
+        selected.myfamily = family;
+        selected.myaddr = ifa->ifa_addr;
+        selected.is_wifi = is_wifi;
         if (essid_ok) {
-          has_essid = true;
-          memcpy(essid, cfg.essid, sizeof(essid));
+          selected.has_essid = true;
+          memcpy(selected.essid, cfg.essid, sizeof(selected.essid));
         }
-      } else if (!has_essid && essid_ok) { /* prefer wifi */
-        myfamily = family;
-        myaddr = ifa->ifa_addr;
-        has_essid = true;
-        memcpy(essid, cfg.essid, sizeof(essid));
       }
     }
   }
 
-  if (myfamily == 0) {
+  if (selected.myfamily == 0) {
     fprintf(stderr, "could not find an acceptable address to bind to.\n");
     return -1;
   }
@@ -618,7 +622,7 @@ int skt_session_choose_address(skt_st* skt) {
     return -1;
   }
   */
-  if ((rc = uv_tcp_bind(&skt->listen_socket, myaddr, 0))) {
+  if ((rc = uv_tcp_bind(&skt->listen_socket, selected.myaddr, 0))) {
     fprintf(stderr, "failed to bind: (%d) %s\n", rc, uv_strerror(rc));
     return -1;
   }    
@@ -630,8 +634,8 @@ int skt_session_choose_address(skt_st* skt) {
     fprintf(stderr, "needed more space (%d) than expected (%zd) for getsockname\n", skt->sa_serv_storage_sz, sizeof(skt->sa_serv_storage));
     return -1;
   }
-  if (skt->sa_serv_storage.ss_family != myfamily) {
-    fprintf(stderr, "was expecting address family %d after binding, got %d\n", myfamily, skt->sa_serv_storage.ss_family);
+  if (skt->sa_serv_storage.ss_family != selected.myfamily) {
+    fprintf(stderr, "was expecting address family %d after binding, got %d\n", selected.myfamily, skt->sa_serv_storage.ss_family);
     return -1;
   }
   if (print_address_name(&skt->sa_serv_storage, skt->addrp, sizeof(skt->addrp), &skt->port))
@@ -641,7 +645,7 @@ int skt_session_choose_address(skt_st* skt) {
     fprintf(stderr, "failed to listen: (%d) %s\n", errno, strerror(errno));
     return -1;
   }
-  if (has_essid)
+  if (selected.has_essid)
     skt->essid = strdup(cfg.essid);
   return 0;
 }
