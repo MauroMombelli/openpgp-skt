@@ -32,7 +32,7 @@ const char priority[] = "NORMAL:-CTYPE-ALL"
 const char pgp_begin[] = "-----BEGIN PGP PRIVATE KEY BLOCK-----";
 const char pgp_end[] = "\n-----END PGP PRIVATE KEY BLOCK-----";
 
-
+#define ANSI_ESC "\x1b["
 #define PSK_BYTES 16
 
 typedef struct skt_session skt_st;
@@ -54,6 +54,7 @@ void skt_session_display_incoming_key_menu(skt_st *skt, FILE *f);
 int skt_session_close_tls(skt_st *skt);
 int skt_session_import_incoming_key(skt_st *skt, gpgme_key_t k);
 int recursive_unlink(const char *pathname, int log_level);
+void clearscreen(FILE *f);
 
 struct skt_session {
   uv_loop_t *loop;
@@ -195,6 +196,10 @@ ssize_t skt_session_gpgme_write(void *h, const void *buf, size_t sz) {
   return sz;
 }
 
+void clearscreen(FILE* f) {
+  fprintf(f, "%s", ANSI_ESC "2J" ANSI_ESC "0;0H");
+  fflush(f);
+}
 
 int skt_session_import_incoming_key(skt_st *skt, gpgme_key_t k) {
   gpgme_error_t gerr;
@@ -1377,6 +1382,8 @@ int main(int argc, const char *argv[]) {
     return -1;
   }
 
+  clearscreen(stdout);
+  
   /* construct string */
   urlbuf[sizeof(urlbuf)-1] = 0;
   urllen = snprintf(urlbuf, sizeof(urlbuf)-1, "%s://%s@%s%s%s:%d", schema, skt->pskhex,
