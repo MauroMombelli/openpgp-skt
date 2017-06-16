@@ -34,7 +34,7 @@ const char pgp_end[] = "\n-----END PGP PRIVATE KEY BLOCK-----";
 
 #define PSK_BYTES 16
 
-struct session_status;
+typedef struct skt_session skt_st;
 
 struct imported_key {
   char *fpr;
@@ -44,17 +44,17 @@ struct imported_key {
 
 int print_qrcode(FILE* f, const QRcode* qrcode);
 int print_address_name(struct sockaddr_storage *addr, char *paddr, size_t paddrsz, int *port);
-void its_all_over(struct session_status *status, const char *fmt, ...);
-void session_status_connect(uv_stream_t* server, int status);
-int session_status_gather_secret_keys(struct session_status *status);
-void session_status_release_all_gpg_keys(struct session_status *status);
-void session_status_display_key_menu(struct session_status *status, FILE *f);
-void session_status_display_incoming_key_menu(struct session_status *status, FILE *f);
-int session_status_close_tls(struct session_status *status);
-int session_status_import_incoming_key(struct session_status *status, gpgme_key_t k);
+void its_all_over(skt_st *skt, const char *fmt, ...);
+void skt_session_connect(uv_stream_t* server, int status);
+int skt_session_gather_secret_keys(skt_st *skt);
+void skt_session_release_all_gpg_keys(skt_st *skt);
+void skt_session_display_key_menu(skt_st *skt, FILE *f);
+void skt_session_display_incoming_key_menu(skt_st *skt, FILE *f);
+int skt_session_close_tls(skt_st *skt);
+int skt_session_import_incoming_key(skt_st *skt, gpgme_key_t k);
 int recursive_unlink(const char *pathname, int log_level);
 
-struct session_status {
+struct skt_session {
   uv_loop_t *loop;
   uv_tcp_t listen_socket;
   uv_tcp_t accepted_socket;
@@ -94,30 +94,30 @@ struct session_status {
 };
 
 
-void session_status_free(struct session_status *status) {
-  if (status) {
-    session_status_release_all_gpg_keys(status);
-    if (status->gpgctx)
-      gpgme_release(status->gpgctx);
-    if (status->incoming)
-      gpgme_release(status->incoming);
-    if (status->incomingkey.data) {
-      free(status->incomingkey.data);
+void skt_session_free(skt_st *skt) {
+  if (skt) {
+    skt_session_release_all_gpg_keys(skt);
+    if (skt->gpgctx)
+      gpgme_release(skt->gpgctx);
+    if (skt->incoming)
+      gpgme_release(skt->incoming);
+    if (skt->incomingkey.data) {
+      free(skt->incomingkey.data);
     }
-    if (status->incomingdir) {
+    if (skt->incomingdir) {
       /* FIXME: really tear down the ephemeral homedir */
-      if (recursive_unlink(status->incomingdir, status->log_level))
-        fprintf(stderr, "failed to recursively remove ('%s'): (%d) %s\n", status->incomingdir, errno, strerror(errno));
+      if (recursive_unlink(skt->incomingdir, skt->log_level))
+        fprintf(stderr, "failed to recursively remove ('%s'): (%d) %s\n", skt->incomingdir, errno, strerror(errno));
 
       /* FIXME: should we also try to kill all running daemons?*/
-      free(status->incomingdir);
+      free(skt->incomingdir);
     }
-    if (status->session) {
-      session_status_close_tls(status);
+    if (skt->session) {
+      skt_session_close_tls(skt);
     }
-    if (status->ifap)
-      freeifaddrs(status->ifap);
-    free(status);
+    if (skt->ifap)
+      freeifaddrs(skt->ifap);
+    free(skt);
   }
 }
 
@@ -159,16 +159,16 @@ int recursive_unlink(const char *path, int log_level) {
 }
 
 void input_alloc_cb(uv_handle_t* handle, size_t suggested_size, uv_buf_t* buf) {
-  /*  struct session_status *status = handle->data; */
+  /*  skt_st *skt = handle->data; */
   buf->base = malloc(1);
   buf->len = buf->base ? 1 : 0;
 }
 
-ssize_t session_status_gpgme_write(void *h, const void *buf, size_t sz) {
-  struct session_status *status = h;
-  if (status->log_level > 3)
-    fprintf(stderr, "got %zd octets of data from gpgme (%p)\n", sz, (void*)status);
-  int rc = gnutls_record_send(status->session, buf, sz); /* FIXME: blocking */
+ssize_t skt_session_gpgme_write(void *h, const void *buf, size_t sz) {
+  skt_st *skt = h;
+  if (skt->log_level > 3)
+    fprintf(stderr, "got %zd octets of data from gpgme (%p)\n", sz, (void*)skt);
+  int rc = gnutls_record_send(skt->session, buf, sz); /* FIXME: blocking */
   if (rc < 0) {
     switch (rc) {
     case GNUTLS_E_AGAIN:
@@ -188,7 +188,7 @@ ssize_t session_status_gpgme_write(void *h, const void *buf, size_t sz) {
 }
 
 
-int session_status_import_incoming_key(struct session_status *status, gpgme_key_t k) {
+int skt_session_import_incoming_key(skt_st *skt, gpgme_key_t k) {
   gpgme_error_t gerr;
   gpgme_data_t d[2];
   char *pattern = NULL;
@@ -196,7 +196,7 @@ int session_status_import_incoming_key(struct session_status *status, gpgme_key_
   int fds[2];
   gpgme_export_mode_t mode = GPGME_EXPORT_MODE_SECRET;
 
-  if (status->log_level > 0)
+  if (skt->log_level > 0)
     fprintf(stderr, "Importing key %s\n", k->fpr);
 
   if (pipe2(fds, O_CLOEXEC)) {
@@ -223,9 +223,9 @@ int session_status_import_incoming_key(struct session_status *status, gpgme_key_
     }
     return rc;
   }
-  gpgme_set_armor(status->incoming, 1);
+  gpgme_set_armor(skt->incoming, 1);
 
-  gerr = gpgme_op_export(status->incoming, pattern, mode, d[1]);
+  gerr = gpgme_op_export(skt->incoming, pattern, mode, d[1]);
   gpgme_data_release(d[1]);
   close(fds[1]);
   free(pattern);
@@ -236,7 +236,7 @@ int session_status_import_incoming_key(struct session_status *status, gpgme_key_
     return EIO;
   }
 
-  gerr = gpgme_op_import(status->gpgctx, d[0]);
+  gerr = gpgme_op_import(skt->gpgctx, d[0]);
   gpgme_data_release(d[0]);
   close(fds[0]);
   if (gerr) {
@@ -244,7 +244,7 @@ int session_status_import_incoming_key(struct session_status *status, gpgme_key_
             gerr, gpgme_strerror(gerr));
     return EIO;
   }
-  gpgme_import_result_t result = gpgme_op_import_result(status->gpgctx);
+  gpgme_import_result_t result = gpgme_op_import_result(skt->gpgctx);
   if (!result) {
     fprintf(stderr, "failure to get gpgme_op_import_result().\n");
     return EIO;
@@ -268,29 +268,29 @@ int session_status_import_incoming_key(struct session_status *status, gpgme_key_
 
 
 /* FIXME: should be const, but gpgme is cranky */
-struct gpgme_data_cbs gpg_callbacks = { .write = session_status_gpgme_write };
+struct gpgme_data_cbs gpg_callbacks = { .write = skt_session_gpgme_write };
 
-int session_status_send_key(struct session_status *status, gpgme_key_t key) {
+int skt_session_send_key(skt_st *skt, gpgme_key_t key) {
   int rc = 0;
   gpgme_error_t gerr = 0;
   gpgme_export_mode_t mode = GPGME_EXPORT_MODE_MINIMAL | GPGME_EXPORT_MODE_SECRET;
   char *pattern = NULL;
   gpgme_data_t data = NULL;
 
-  status->active = true;
-  gpgme_set_armor(status->gpgctx, 1);
+  skt->active = true;
+  gpgme_set_armor(skt->gpgctx, 1);
   rc = asprintf(&pattern, "0x%s", key->fpr);
   if (rc == -1) {
     fprintf(stderr, "failed to malloc appropriately!\n");
     return -1;
   }
-  if ((gerr = gpgme_data_new_from_cbs(&data, &gpg_callbacks, status))) {
+  if ((gerr = gpgme_data_new_from_cbs(&data, &gpg_callbacks, skt))) {
     free(pattern);
     fprintf(stderr, "failed to make new gpgme_data_t object: (%d) %s\n", gerr, gpgme_strerror(gerr));
     return -1;
   }
   /* FIXME: blocking! */
-  if ((gerr = gpgme_op_export(status->gpgctx, pattern, mode, data))) {
+  if ((gerr = gpgme_op_export(skt->gpgctx, pattern, mode, data))) {
     free(pattern);
     fprintf(stderr, "failed to export key: (%d) %s\n", gerr, gpgme_strerror(gerr));
     return -1;
@@ -301,88 +301,88 @@ int session_status_send_key(struct session_status *status, gpgme_key_t key) {
   return 0;
 }
 
-void ctrl_c(struct session_status *status) {
-  its_all_over(status, "got ctrl-c\n");
+void ctrl_c(skt_st *skt) {
+  its_all_over(skt, "got ctrl-c\n");
 }
 
-void ctrl_d(struct session_status *status) {
-  its_all_over(status, "got ctrl-d\n");
+void ctrl_d(skt_st *skt) {
+  its_all_over(skt, "got ctrl-d\n");
 }
 
 
-void ctrl_l(struct session_status *status) {
+void ctrl_l(skt_st *skt) {
   /* FIXME: refresh the screen */
 }
 
-void quit(struct session_status *status) {
-  its_all_over(status, "quitting…\n");
+void quit(skt_st *skt) {
+  its_all_over(skt, "quitting…\n");
 }
 
 void input_read_cb(uv_stream_t* stream, ssize_t nread, const uv_buf_t* buf) {
-  struct session_status *status = stream->data;
+  skt_st *skt = stream->data;
   int rc;
   if (nread > 0) {
     int c = buf->base[0];
     if (c == 3) {
-      ctrl_c(status);
+      ctrl_c(skt);
     } else if (c == 4) {
-      ctrl_d(status);
+      ctrl_d(skt);
     } else if (c == 12) {
-      ctrl_l(status);
+      ctrl_l(skt);
     } else if (tolower(c) == 'q' || c == 0x1B /* ESC */) {
-      quit(status);
-    } else if (status->incomingdir) {
+      quit(skt);
+    } else if (skt->incomingdir) {
       if (c >= '0' && c <= '9') {
         fprintf(stderr, "The other device is already sending keys.\nQuit and reconnect to push keys the other way.\n");
       } else if (c >= 'a' && c <= ('a' + 7)) {
-        int x = (c - 'a') + status->inkeylist_offset;
-        if ((rc = session_status_import_incoming_key(status, status->inkeys[x].key)))
+        int x = (c - 'a') + skt->inkeylist_offset;
+        if ((rc = skt_session_import_incoming_key(skt, skt->inkeys[x].key)))
           fprintf(stderr, "failed to import key: (%d) %s\n", rc, strerror(rc));
       } else if (c == 'n') {
-        if (status->num_inkeys < 9)
+        if (skt->num_inkeys < 9)
           fprintf(stderr, "No more keys to display\n");
-        status->inkeylist_offset += 8;
-        if (status->inkeylist_offset >= status->num_inkeys)
-          status->inkeylist_offset = 0;
-        session_status_display_incoming_key_menu(status, stdout);
+        skt->inkeylist_offset += 8;
+        if (skt->inkeylist_offset >= skt->num_inkeys)
+          skt->inkeylist_offset = 0;
+        skt_session_display_incoming_key_menu(skt, stdout);
       }
     } else if (c == '0') {
       fprintf(stderr, "FIXME: sending a file from active mode is not yet implemented!\n");
     } else if (c >= '1' && c <= '8') {
-      int x = (c-'1') + status->keylist_offset;
-      session_status_send_key(status, status->keys[x]);
+      int x = (c-'1') + skt->keylist_offset;
+      skt_session_send_key(skt, skt->keys[x]);
     } else if (c == '9' || c == 'n') {
-      if (status->num_keys < 9)
+      if (skt->num_keys < 9)
         fprintf(stderr, "No more keys to display\n");
-      status->keylist_offset += 8;
-      if (status->keylist_offset >= status->num_keys)
-        status->keylist_offset = 0;
-      session_status_display_key_menu(status, stdout);
+      skt->keylist_offset += 8;
+      if (skt->keylist_offset >= skt->num_keys)
+        skt->keylist_offset = 0;
+      skt_session_display_key_menu(skt, stdout);
     } else {
-      if (status->log_level > 2)
+      if (skt->log_level > 2)
         fprintf(stderr, "Got %d (0x%02x) '%.1s'\n", buf->base[0], buf->base[0], isprint(buf->base[0])? buf->base : "_");
     }
   } else if (nread < 0) {
-    its_all_over(status, "Got error during input_read_cb: (%d) %s\n", nread, uv_strerror(nread));
+    its_all_over(skt, "Got error during input_read_cb: (%d) %s\n", nread, uv_strerror(nread));
   }
   if (buf && buf->base)
     free(buf->base);
 }
 
 void input_close_cb(uv_handle_t *handle) {
-  struct session_status *status = handle->data;
+  skt_st *skt = handle->data;
   int rc;
-  if ((rc = uv_tty_set_mode(&status->input, UV_TTY_MODE_NORMAL)))
+  if ((rc = uv_tty_set_mode(&skt->input, UV_TTY_MODE_NORMAL)))
     fprintf(stderr, "failed to switch input back to normal mode: (%d) %s\n", rc, uv_strerror(rc));
 }
 
-int session_status_setup_incoming(struct session_status *status) {
+int skt_session_setup_incoming(skt_st *skt) {
   gpgme_error_t gerr;
   int rc;
   char *xdg = getenv("XDG_RUNTIME_DIR");
   bool xdgf = false;
 
-  assert(status->incoming == NULL);
+  assert(skt->incoming == NULL);
   
   if (xdg == NULL) {
     rc = asprintf(&xdg, "/run/user/%d", getuid());
@@ -405,25 +405,25 @@ int session_status_setup_incoming(struct session_status *status) {
     }
   }
        
-  rc = asprintf(&status->incomingdir, "%s/skt-server.XXXXXX", xdg);
+  rc = asprintf(&skt->incomingdir, "%s/skt-server.XXXXXX", xdg);
   if (rc == -1) {
     fprintf(stderr, "Failed to allocate ephemeral GnuPG directory name in %s\n", xdg);
     goto fail;
   }
-  if (NULL == mkdtemp(status->incomingdir)) {
-    fprintf(stderr, "failed to generate an ephemeral GnuPG homedir from template '%s'\n", status->incomingdir);
-    free(status->incomingdir);
-    status->incomingdir = NULL;
+  if (NULL == mkdtemp(skt->incomingdir)) {
+    fprintf(stderr, "failed to generate an ephemeral GnuPG homedir from template '%s'\n", skt->incomingdir);
+    free(skt->incomingdir);
+    skt->incomingdir = NULL;
     goto fail;
   }
   
-  if ((gerr = gpgme_new(&status->incoming))) {
+  if ((gerr = gpgme_new(&skt->incoming))) {
     fprintf(stderr, "gpgme_new failed when setting up ephemeral incoming directory: (%d), %s\n",
             gerr, gpgme_strerror(gerr));
     goto fail;
   }
-  if ((gerr = gpgme_ctx_set_engine_info(status->incoming, GPGME_PROTOCOL_OpenPGP, NULL, status->incomingdir))) {
-    fprintf(stderr, "gpgme_ctx_set_engine_info failed for ephemeral homedir %s: (%d), %s\n", status->incomingdir, gerr, gpgme_strerror(gerr));
+  if ((gerr = gpgme_ctx_set_engine_info(skt->incoming, GPGME_PROTOCOL_OpenPGP, NULL, skt->incomingdir))) {
+    fprintf(stderr, "gpgme_ctx_set_engine_info failed for ephemeral homedir %s: (%d), %s\n", skt->incomingdir, gerr, gpgme_strerror(gerr));
     goto fail;
   }
 
@@ -433,59 +433,59 @@ int session_status_setup_incoming(struct session_status *status) {
  fail:
   if (xdgf)
     free(xdg);
-  if (status->incomingdir) {
-    if (rmdir(status->incomingdir))
-      fprintf(stderr, "failed to rmdir('%s'): (%d) %s\n", status->incomingdir, errno, strerror(errno));
-    free(status->incomingdir);
-    status->incomingdir = NULL;
+  if (skt->incomingdir) {
+    if (rmdir(skt->incomingdir))
+      fprintf(stderr, "failed to rmdir('%s'): (%d) %s\n", skt->incomingdir, errno, strerror(errno));
+    free(skt->incomingdir);
+    skt->incomingdir = NULL;
   }
   return -1;
 }
 
-struct session_status * session_status_new(uv_loop_t *loop, int log_level) {
-  struct session_status *status = calloc(1, sizeof(struct session_status));
-  size_t pskhexsz = sizeof(status->pskhex);
+skt_st * skt_session_new(uv_loop_t *loop, int log_level) {
+  skt_st *skt = calloc(1, sizeof(skt_st));
+  size_t pskhexsz = sizeof(skt->pskhex);
   gpgme_error_t gerr = GPG_ERR_NO_ERROR;
   int rc;
   
-  if (status) {
-    status->loop = loop;
-    status->log_level = log_level;
-    status->sa_serv_storage_sz = sizeof (status->sa_serv_storage);
-    status->sa_cli_storage_sz = sizeof (status->sa_cli_storage);
+  if (skt) {
+    skt->loop = loop;
+    skt->log_level = log_level;
+    skt->sa_serv_storage_sz = sizeof (skt->sa_serv_storage);
+    skt->sa_cli_storage_sz = sizeof (skt->sa_cli_storage);
 
-    if ((gerr = gpgme_new(&status->gpgctx))) {
+    if ((gerr = gpgme_new(&skt->gpgctx))) {
       fprintf(stderr, "gpgme_new failed: (%d), %s\n", gerr, gpgme_strerror(gerr));
       goto fail;
     }
-    if ((gerr = gpgme_ctx_set_engine_info(status->gpgctx, GPGME_PROTOCOL_OpenPGP, NULL, NULL))) {
+    if ((gerr = gpgme_ctx_set_engine_info(skt->gpgctx, GPGME_PROTOCOL_OpenPGP, NULL, NULL))) {
       fprintf(stderr, "gpgme_ctx_set_engine_info failed: (%d), %s\n", gerr, gpgme_strerror(gerr));
       goto fail;
     }
 
     /* choose random number */  
-    if ((rc = gnutls_key_generate(&status->psk, PSK_BYTES))) {
+    if ((rc = gnutls_key_generate(&skt->psk, PSK_BYTES))) {
       fprintf(stderr, "failed to get randomness: (%d) %s\n", rc, gnutls_strerror(rc));
       goto fail;
     }
-    if ((rc = gnutls_hex_encode(&status->psk, status->pskhex, &pskhexsz))) {
+    if ((rc = gnutls_hex_encode(&skt->psk, skt->pskhex, &pskhexsz))) {
       fprintf(stderr, "failed to encode PSK as a hex string: (%d) %s\n", rc, gnutls_strerror(rc));
       goto fail;
     }
-    if (pskhexsz != sizeof(status->pskhex)) {
+    if (pskhexsz != sizeof(skt->pskhex)) {
       fprintf(stderr, "bad calculation for psk size\n");
       goto fail;
     }
-    for (int ix = 0; ix < sizeof(status->pskhex)-1; ix++)
-      status->pskhex[ix] = toupper(status->pskhex[ix]);
+    for (int ix = 0; ix < sizeof(skt->pskhex)-1; ix++)
+      skt->pskhex[ix] = toupper(skt->pskhex[ix]);
   }
- return status;
+ return skt;
  fail:
-  session_status_free(status);
+  skt_session_free(skt);
   return NULL;
 }
 
-int session_status_choose_address(struct session_status* status) {
+int skt_session_choose_address(skt_st* skt) {
   struct ifaddrs *ifa;
   struct sockaddr *myaddr = NULL;
   int myfamily = 0;
@@ -493,11 +493,11 @@ int session_status_choose_address(struct session_status* status) {
   /*  int optval = 1; */
   
   /* pick an IP address with getifaddrs instead of using in6addr_any */
-  if (getifaddrs(&status->ifap)) {
+  if (getifaddrs(&skt->ifap)) {
     fprintf(stderr, "getifaddrs failed: (%d) %s\n", errno, strerror(errno));
     return -1;
   }
-  for (ifa = status->ifap; ifa; ifa = ifa->ifa_next) {
+  for (ifa = skt->ifap; ifa; ifa = ifa->ifa_next) {
     char addrstring[INET6_ADDRSTRLEN];
     bool skip = false;
     int family = 0;
@@ -519,17 +519,17 @@ int session_status_choose_address(struct session_status* status) {
       strcpy(addrstring, "<no address>");
     }
     if (ifa->ifa_flags & IFF_LOOPBACK) {
-      if (status->log_level > 2)
+      if (skt->log_level > 2)
         fprintf(stderr, "skipping %s because it is loopback\n", ifa->ifa_name);
       continue;
     }
     if (!(ifa->ifa_flags & IFF_UP)) {
-      if (status->log_level > 2)
+      if (skt->log_level > 2)
         fprintf(stderr, "skipping %s because it is not up\n", ifa->ifa_name);
       continue;
     }
     if (!skip) {
-      if (status->log_level > 2)
+      if (skt->log_level > 2)
         fprintf(stdout, "%s %s: %s (flags: 0x%x)\n", myaddr==NULL?"*":" ", ifa->ifa_name, addrstring, ifa->ifa_flags);
       /* FIXME: we're just taking the first up, non-loopback address */
       /* be cleverer about prefering wifi, preferring link-local addresses, and RFC1918 addressses. */
@@ -546,36 +546,36 @@ int session_status_choose_address(struct session_status* status) {
   }
   
   /* open listening socket */
-  if ((rc = uv_tcp_init(status->loop, &status->listen_socket))) {
+  if ((rc = uv_tcp_init(skt->loop, &skt->listen_socket))) {
     fprintf(stderr, "failed to allocate a socket: (%d) %s\n", rc, uv_strerror(rc));
     return -1;
   }
   /* FIXME: i don't know how to set SO_REUSEADDR for libuv.  maybe we don't need it, though.
-  if ((rc = setsockopt(status->listen_socket, SOL_SOCKET, SO_REUSEADDR, (void *) &optval, sizeof(int)))) {
+  if ((rc = setsockopt(skt->listen_socket, SOL_SOCKET, SO_REUSEADDR, (void *) &optval, sizeof(int)))) {
     fprintf(stderr, "failed to set SO_REUSEADDR: (%d) %s\n", errno, strerror(errno));
     return -1;
   }
   */
-  if ((rc = uv_tcp_bind(&status->listen_socket, myaddr, 0))) {
+  if ((rc = uv_tcp_bind(&skt->listen_socket, myaddr, 0))) {
     fprintf(stderr, "failed to bind: (%d) %s\n", rc, uv_strerror(rc));
     return -1;
   }    
-  if ((rc = uv_tcp_getsockname(&status->listen_socket, (struct sockaddr *) &status->sa_serv_storage, &status->sa_serv_storage_sz))) {
+  if ((rc = uv_tcp_getsockname(&skt->listen_socket, (struct sockaddr *) &skt->sa_serv_storage, &skt->sa_serv_storage_sz))) {
     fprintf(stderr, "failed to uv_tcp_getsockname: (%d) %s\n", rc, uv_strerror(rc));
     return -1;
   }
-  if (status->sa_serv_storage_sz > sizeof(status->sa_serv_storage)) {
-    fprintf(stderr, "needed more space (%d) than expected (%zd) for getsockname\n", status->sa_serv_storage_sz, sizeof(status->sa_serv_storage));
+  if (skt->sa_serv_storage_sz > sizeof(skt->sa_serv_storage)) {
+    fprintf(stderr, "needed more space (%d) than expected (%zd) for getsockname\n", skt->sa_serv_storage_sz, sizeof(skt->sa_serv_storage));
     return -1;
   }
-  if (status->sa_serv_storage.ss_family != myfamily) {
-    fprintf(stderr, "was expecting address family %d after binding, got %d\n", myfamily, status->sa_serv_storage.ss_family);
+  if (skt->sa_serv_storage.ss_family != myfamily) {
+    fprintf(stderr, "was expecting address family %d after binding, got %d\n", myfamily, skt->sa_serv_storage.ss_family);
     return -1;
   }
-  if (print_address_name(&status->sa_serv_storage, status->addrp, sizeof(status->addrp), &status->port))
+  if (print_address_name(&skt->sa_serv_storage, skt->addrp, sizeof(skt->addrp), &skt->port))
     return -1;
-  status->listen_socket.data = status;
-  if ((rc = uv_listen((uv_stream_t*)(&status->listen_socket), 0, session_status_connect))) {
+  skt->listen_socket.data = skt;
+  if ((rc = uv_listen((uv_stream_t*)(&skt->listen_socket), 0, skt_session_connect))) {
     fprintf(stderr, "failed to listen: (%d) %s\n", errno, strerror(errno));
     return -1;
   }
@@ -584,18 +584,18 @@ int session_status_choose_address(struct session_status* status) {
 
 
 int get_psk_creds(gnutls_session_t session, const char* username, gnutls_datum_t* key) {
-  struct session_status *status;
-  status = gnutls_session_get_ptr(session);
+  skt_st *skt;
+  skt = gnutls_session_get_ptr(session);
   
-  if (status->log_level > 2)
+  if (skt->log_level > 2)
     fprintf(stderr, "sent username: %s, PSK: %s\n",
             username, /* dangerous: random bytes from the network! */
-            status->pskhex); 
-  key->size = status->psk.size;
-  key->data = gnutls_malloc(status->psk.size);
+            skt->pskhex); 
+  key->size = skt->psk.size;
+  key->data = gnutls_malloc(skt->psk.size);
   if (!key->data)
     return GNUTLS_E_MEMORY_ERROR;
-  memcpy(key->data, status->psk.data, status->psk.size);
+  memcpy(key->data, skt->psk.data, skt->psk.size);
   return GNUTLS_E_SUCCESS;
 }
 
@@ -698,145 +698,145 @@ int print_address_name(struct sockaddr_storage *addr, char *paddr, size_t paddrs
   return 0;
 }
 
-int session_status_close_tls(struct session_status *status) {
+int skt_session_close_tls(skt_st *skt) {
   int rc;
-  assert(status->session);
-  if ((rc = gnutls_bye(status->session, GNUTLS_SHUT_RDWR))) {
+  assert(skt->session);
+  if ((rc = gnutls_bye(skt->session, GNUTLS_SHUT_RDWR))) {
     fprintf(stderr, "gnutls_bye got error (%d) %s\n", rc, gnutls_strerror(rc));
     return -1;
   }
-  gnutls_deinit(status->session);
-  status->session = NULL;
-  if ((rc = uv_read_stop((uv_stream_t*)&status->accepted_socket))) {
+  gnutls_deinit(skt->session);
+  skt->session = NULL;
+  if ((rc = uv_read_stop((uv_stream_t*)&skt->accepted_socket))) {
     fprintf(stderr, "failed to stop reading the TLS stream (%d) %s\n", rc, uv_strerror(rc));
     return -1;
   }    
   return 0;
 }
 
-void its_all_over(struct session_status *status, const char *fmt, ...) {
+void its_all_over(skt_st *skt, const char *fmt, ...) {
   va_list ap;
   int rc;
   va_start(ap, fmt);
   vfprintf(stderr, fmt, ap);
   va_end(ap);
   /* FIXME: how to tear it all down? */
-  if (status->session) {
-    session_status_close_tls(status);
+  if (skt->session) {
+    skt_session_close_tls(skt);
   }
-  if (status->input.data && !uv_is_closing((uv_handle_t*)(&status->input))) {
+  if (skt->input.data && !uv_is_closing((uv_handle_t*)(&skt->input))) {
     if ((rc = uv_tty_reset_mode()))
       fprintf(stderr, "failed to uv_tty_reset_mode: (%d) %s\n", rc, uv_strerror(rc));
-    uv_close((uv_handle_t*)(&status->input), input_close_cb);
+    uv_close((uv_handle_t*)(&skt->input), input_close_cb);
   }
-  uv_stop(status->loop);
+  uv_stop(skt->loop);
 }
 
 /* FIXME: this would only be used in the event of a fully asynchronous
    write.  however, i don't see how to keep track of the memory being
    written correctly in that case.
 
-void session_status_write_done(uv_write_t* req, int x) {
+void skt_session_write_done(uv_write_t* req, int x) {
   if (x) {
     fprintf(stderr, "write failed: (%d) %s\n", x, uv_strerror(x));
     return;
   }
-  struct session_status *status = req->handle->data;
+  skt_st *skt = req->handle->data;
   
   free(req);
 }
 */
 
-ssize_t session_status_gnutls_push_func(gnutls_transport_ptr_t ptr, const void* buf, size_t sz) {
-  struct session_status *status = ptr;
+ssize_t skt_session_gnutls_push_func(gnutls_transport_ptr_t ptr, const void* buf, size_t sz) {
+  skt_st *skt = ptr;
   int rc;
   /* FIXME: be more asynchronous in writes; here we're just trying to be synchronous */
   
   /* FIXME: i do not like casting away constness here */
   uv_buf_t b[] = {{ .base = (void*) buf, .len = sz }}; 
 
-  rc = uv_try_write((uv_stream_t*)(&status->accepted_socket), b, sizeof(b)/sizeof(b[0]));
+  rc = uv_try_write((uv_stream_t*)(&skt->accepted_socket), b, sizeof(b)/sizeof(b[0]));
   if (rc >= 0)
     return rc;
   fprintf(stderr, "got error %d (%s) when trying to write %zd octets\n", rc, uv_strerror(rc), sz);
   if (rc == UV_EAGAIN) {
-    gnutls_transport_set_errno(status->session, EAGAIN);
+    gnutls_transport_set_errno(skt->session, EAGAIN);
     return -1;
   }
-  gnutls_transport_set_errno(status->session, EIO);
+  gnutls_transport_set_errno(skt->session, EIO);
   return -1;
 }
 
-ssize_t session_status_gnutls_pull_func(gnutls_transport_ptr_t ptr, void* buf, size_t sz) {
-  struct session_status *status = ptr;
-  int available = status->end - status->start;
-  if (uv_is_closing((uv_handle_t*)(&status->accepted_socket)))
+ssize_t skt_session_gnutls_pull_func(gnutls_transport_ptr_t ptr, void* buf, size_t sz) {
+  skt_st *skt = ptr;
+  int available = skt->end - skt->start;
+  if (uv_is_closing((uv_handle_t*)(&skt->accepted_socket)))
     return 0;
-  if (status->end == status->start) {
-    gnutls_transport_set_errno(status->session, EAGAIN);
+  if (skt->end == skt->start) {
+    gnutls_transport_set_errno(skt->session, EAGAIN);
     return -1;
   }
   /* FIXME: this seems like an extra unnecessary copy.  can we arrange
      it so that the buffer gets passed through to the uv_alloc_cb? */
-  if (sz >= status->end - status->start) {
-    memcpy(buf, status->tlsreadbuf + status->start, available);
-    status->start = status->end = 0;
+  if (sz >= skt->end - skt->start) {
+    memcpy(buf, skt->tlsreadbuf + skt->start, available);
+    skt->start = skt->end = 0;
     return available;
   } else {
-    memcpy(buf, status->tlsreadbuf + status->start, sz);
-    status->start += sz;
+    memcpy(buf, skt->tlsreadbuf + skt->start, sz);
+    skt->start += sz;
     return sz;
   }
 }
 
-void session_status_alloc_cb(uv_handle_t* handle, size_t suggested_size, uv_buf_t* buf) {
-  struct session_status *status = handle->data;
-  assert(handle == (uv_handle_t*)(&status->accepted_socket));
-  buf->base = status->tlsreadbuf + status->end;
-  buf->len = sizeof(status->tlsreadbuf) - status->end;
+void skt_session_alloc_cb(uv_handle_t* handle, size_t suggested_size, uv_buf_t* buf) {
+  skt_st *skt = handle->data;
+  assert(handle == (uv_handle_t*)(&skt->accepted_socket));
+  buf->base = skt->tlsreadbuf + skt->end;
+  buf->len = sizeof(skt->tlsreadbuf) - skt->end;
   /* FIXME: should consider how to read partial buffers, if these don't match a TLS record */
 }
 
-void session_status_handshake_done(struct session_status *status) {
+void skt_session_handshake_done(skt_st *skt) {
   char *desc;
   int rc;
-  desc = gnutls_session_get_desc(status->session);
+  desc = gnutls_session_get_desc(skt->session);
   fprintf(stdout, "TLS handshake complete: %s\n", desc);
   gnutls_free(desc);
-  status->handshake_done = true;
+  skt->handshake_done = true;
   /* FIXME: should flush all input before starting to respond to it */
-  if ((rc = uv_tty_init(status->loop, &status->input, 0, 1))) {
+  if ((rc = uv_tty_init(skt->loop, &skt->input, 0, 1))) {
     fprintf(stderr, "failed to grab stdin for reading, using passive mode only: (%d) %s\n", rc, uv_strerror(rc));
-  } else if ((rc = uv_tty_set_mode(&status->input, UV_TTY_MODE_RAW))) {
+  } else if ((rc = uv_tty_set_mode(&skt->input, UV_TTY_MODE_RAW))) {
     fprintf(stderr, "failed to switch input to raw mode, using passive mode only: (%d) %s\n", rc, uv_strerror(rc));
-    uv_close((uv_handle_t*)(&status->input), input_close_cb);
-  } else if ((rc = uv_read_start((uv_stream_t*)(&status->input), input_alloc_cb, input_read_cb))) {
+    uv_close((uv_handle_t*)(&skt->input), input_close_cb);
+  } else if ((rc = uv_read_start((uv_stream_t*)(&skt->input), input_alloc_cb, input_read_cb))) {
     fprintf(stderr, "failed to start reading from stdin, using passive mode only: (%d) %s\n", rc, uv_strerror(rc));
-    uv_close((uv_handle_t*)(&status->input), input_close_cb);
+    uv_close((uv_handle_t*)(&skt->input), input_close_cb);
   } else {
-    status->input.data = status;
+    skt->input.data = skt;
   }
-  session_status_display_key_menu(status, stdout);
+  skt_session_display_key_menu(skt, stdout);
 }
 
-int session_status_gather_secret_keys(struct session_status *status) {
+int skt_session_gather_secret_keys(skt_st *skt) {
   gpgme_error_t gerr;
   int secret_only = 1;
   const char *pattern = NULL;
   fprintf(stdout, "Gathering a list of available OpenPGP secret keys...\n");
-  if ((gerr = gpgme_op_keylist_start(status->gpgctx, pattern, secret_only))) {
+  if ((gerr = gpgme_op_keylist_start(skt->gpgctx, pattern, secret_only))) {
     fprintf(stderr, "Failed to start gathering keys: (%d) %s\n", gerr, gpgme_strerror(gerr));
     return 1;
   }
   while (!gerr) {
     gpgme_key_t key = NULL;
-    gerr = gpgme_op_keylist_next(status->gpgctx, &key);
+    gerr = gpgme_op_keylist_next(skt->gpgctx, &key);
     if (!gerr) {
-      status->num_keys++;
-      gpgme_key_t * update = realloc(status->keys, sizeof(status->keys[0]) * status->num_keys);
+      skt->num_keys++;
+      gpgme_key_t * update = realloc(skt->keys, sizeof(skt->keys[0]) * skt->num_keys);
       if (update) {
-        status->keys = update;
-        status->keys[status->num_keys-1] = key;
+        skt->keys = update;
+        skt->keys[skt->num_keys-1] = key;
       } else {
         fprintf(stderr, "out of memory allocating new gpgme_key_t\n");
         goto fail;
@@ -848,74 +848,74 @@ int session_status_gather_secret_keys(struct session_status *status) {
   }
   return 0;
  fail:
-  if ((gerr = gpgme_op_keylist_end(status->gpgctx)))
+  if ((gerr = gpgme_op_keylist_end(skt->gpgctx)))
     fprintf(stderr, "failed to gpgme_op_keylist_end(): (%d) %s\n", gerr, gpgme_strerror(gerr));
-  session_status_release_all_gpg_keys(status);
+  skt_session_release_all_gpg_keys(skt);
   return 1;
 }
 
-void session_status_display_key_menu(struct session_status *status, FILE *f) {
-  int numleft = status->num_keys - status->keylist_offset;
+void skt_session_display_key_menu(skt_st *skt, FILE *f) {
+  int numleft = skt->num_keys - skt->keylist_offset;
   if (numleft > 8)
     numleft = 8;
 
-  if (!status->num_keys)
+  if (!skt->num_keys)
     fprintf(f, "You have no secret keys that you can send.\n");
   fprintf(f, "To receive a key, ask the other device to send it.\n");
 
-  if (status->num_keys) {
+  if (skt->num_keys) {
     fprintf(f, "To send a key, press its number:\n\n");
     for (int ix = 0; ix < numleft; ix++) {
       fprintf(f, "[%d] %s\n    %s\n", (int)(1 + ix),
-              status->keys[status->keylist_offset + ix]->uids->uid,
-              status->keys[status->keylist_offset + ix]->fpr);
+              skt->keys[skt->keylist_offset + ix]->uids->uid,
+              skt->keys[skt->keylist_offset + ix]->fpr);
     }
-    if (status->num_keys > 8)
-      fprintf(f, "\n[9] …more available keys (%zd total)…\n", status->num_keys);
+    if (skt->num_keys > 8)
+      fprintf(f, "\n[9] …more available keys (%zd total)…\n", skt->num_keys);
   }
   fprintf(f, "[0] <choose a file to send>\n[q] to quit\n");
 }
 
-void session_status_display_incoming_key_menu(struct session_status *status, FILE *f) {
-  int numleft = status->num_inkeys - status->inkeylist_offset;
+void skt_session_display_incoming_key_menu(skt_st *skt, FILE *f) {
+  int numleft = skt->num_inkeys - skt->inkeylist_offset;
   if (numleft > 8)
     numleft = 8;
 
-  if (!status->num_inkeys) {
+  if (!skt->num_inkeys) {
     fprintf(f, "The other device has started sending keys, but no valid keys have arrived yet.\n");
   } else {
     fprintf(f, "To import a key, press its letter:\n\n");
     for (int ix = 0; ix < numleft; ix++) {
       fprintf(f, "[%c] %s\n", ('a' + ix),
-              status->inkeys[status->inkeylist_offset + ix].fpr);
-      for (gpgme_user_id_t uid = status->inkeys[status->inkeylist_offset + ix].key->uids; uid; uid = uid->next)
+              skt->inkeys[skt->inkeylist_offset + ix].fpr);
+      for (gpgme_user_id_t uid = skt->inkeys[skt->inkeylist_offset + ix].key->uids; uid; uid = uid->next)
         fprintf(f, "    %s\n", uid->uid);
       fprintf(f, "\n");
     }
-    if (status->num_inkeys > 8)
-      fprintf(f, "\n[n] …more available keys (%zd total)…\n", status->num_inkeys);
+    if (skt->num_inkeys > 8)
+      fprintf(f, "\n[n] …more available keys (%zd total)…\n", skt->num_inkeys);
   }
   fprintf(f, "[q] to quit\n");
 }
 
 
-void session_status_release_all_gpg_keys(struct session_status *status) {
-  if (status->keys) {
-    for (int ix = 0; ix < status->num_keys; ix++) {
-      gpgme_key_release(status->keys[ix]);
+void skt_session_release_all_gpg_keys(skt_st *skt) {
+  if (skt->keys) {
+    for (int ix = 0; ix < skt->num_keys; ix++) {
+      gpgme_key_release(skt->keys[ix]);
     }
-    free(status->keys);
-    status->keys = NULL;
-    status->num_keys = 0;
+    free(skt->keys);
+    skt->keys = NULL;
+    skt->num_keys = 0;
   }
-  if (status->inkeys) {
-    for (int ix = 0; ix < status->num_inkeys; ix++) {
-      free(status->inkeys[ix].fpr);
-      gpgme_key_release(status->inkeys[ix].key);
+  if (skt->inkeys) {
+    for (int ix = 0; ix < skt->num_inkeys; ix++) {
+      free(skt->inkeys[ix].fpr);
+      gpgme_key_release(skt->inkeys[ix].key);
     }
-    free(status->inkeys);
-    status->inkeys = NULL;
-    status->num_inkeys = 0;
+    free(skt->inkeys);
+    skt->inkeys = NULL;
+    skt->num_inkeys = 0;
   }
   
 }
@@ -934,24 +934,24 @@ int append_data(gnutls_datum_t *base, const gnutls_datum_t *suffix, size_t pos) 
   return 0;
 }
 
-void session_status_record_fingerprint(struct session_status *status, const char *fpr) {
+void skt_session_record_fingerprint(skt_st *skt, const char *fpr) {
   /* check if we already have it */
-  for (int ix = 0; ix < status->num_inkeys; ix++) {
-    if (!strcmp(status->inkeys[ix].fpr, fpr)) {
-      status->inkeys[ix].refresh = true;
+  for (int ix = 0; ix < skt->num_inkeys; ix++) {
+    if (!strcmp(skt->inkeys[ix].fpr, fpr)) {
+      skt->inkeys[ix].refresh = true;
       return;
     }
   }
 
   /* if we do not yet, then add it */
-  struct imported_key *newlist = realloc(status->inkeys, sizeof(status->inkeys[0])*(status->num_inkeys+1));
+  struct imported_key *newlist = realloc(skt->inkeys, sizeof(skt->inkeys[0])*(skt->num_inkeys+1));
   if (!newlist) {
     fprintf(stderr, "Failed to allocate more RAM for incoming key, skipping fingerprint %s\n", fpr);
     return;
   }
-  status->inkeys = newlist;
-  struct imported_key *newkey = status->inkeys + status->num_inkeys;
-  status->num_inkeys++;
+  skt->inkeys = newlist;
+  struct imported_key *newkey = skt->inkeys + skt->num_inkeys;
+  skt->num_inkeys++;
   newkey->fpr = strdup(fpr);
   newkey->key = NULL;
   newkey->refresh = true;
@@ -959,18 +959,18 @@ void session_status_record_fingerprint(struct session_status *status, const char
      gpgme_op_get_import_result :( */
 }
 
-int session_status_load_incoming_keys(struct session_status *status) {
+int skt_session_load_incoming_keys(skt_st *skt) {
   gpgme_error_t gerr;
   int secret = 1;
   int ret = 0;
   bool refreshed = false;
-  for (struct imported_key *k = status->inkeys; k < status->inkeys + status->num_inkeys; k++) {
+  for (struct imported_key *k = skt->inkeys; k < skt->inkeys + skt->num_inkeys; k++) {
     if (k->key == NULL || k->refresh) {
       if (k->key) {
         gpgme_key_release(k->key);
         k->key = NULL;
       }
-      if ((gerr = gpgme_get_key(status->incoming, k->fpr, &k->key, secret))) {
+      if ((gerr = gpgme_get_key(skt->incoming, k->fpr, &k->key, secret))) {
         fprintf(stderr, "Failed to get incoming key with fingerprint %s: (%d) %s\n",
                 k->fpr, gerr, gpgme_strerror(gerr));
         ret = EIO;
@@ -980,54 +980,54 @@ int session_status_load_incoming_keys(struct session_status *status) {
   }
 
   if (refreshed)
-    session_status_display_incoming_key_menu(status, stdout);
+    skt_session_display_incoming_key_menu(skt, stdout);
   return ret;
 }
 
-int session_status_ingest_key(struct session_status *status, unsigned char *ptr, size_t sz) {
+int skt_session_ingest_key(skt_st *skt, unsigned char *ptr, size_t sz) {
   gpgme_data_t d;
   gpgme_error_t gerr;
   int copy = 0;
   gpgme_import_result_t result = NULL;
   gpgme_import_status_t newkey = NULL;
     
-  assert(status->incoming);
+  assert(skt->incoming);
   
   if ((gerr = gpgme_data_new_from_mem(&d, (const char *)ptr, sz, copy))) {
     fprintf(stderr, "Failed to allocate new gpgme_data_t: (%d) %s\n", gerr, gpgme_strerror(gerr));
     return ENOMEM;
   }
-  gerr = gpgme_op_import(status->incoming, d);
+  gerr = gpgme_op_import(skt->incoming, d);
   gpgme_data_release(d);
   if (gerr) {
     fprintf(stderr, "Failed to import key: (%d) %s\n", gerr, gpgme_strerror(gerr));
     return ENOMEM;
   }
 
-  result = gpgme_op_import_result(status->incoming);
+  result = gpgme_op_import_result(skt->incoming);
   if (!result) {
     fprintf(stderr, "something went wrong during import to GnuPG\n");
     return EIO;
   }
-  if (status->log_level > 2)
+  if (skt->log_level > 2)
     fprintf(stderr, "Imported %d secret keys\n", result->secret_imported);
 
   for (newkey = result->imports; newkey; newkey = newkey->next) {
     if ((newkey->result == GPG_ERR_NO_ERROR) &&
         (newkey->status & (GPGME_IMPORT_NEW | GPGME_IMPORT_SECRET))) {
-      session_status_record_fingerprint(status, newkey->fpr);
+      skt_session_record_fingerprint(skt, newkey->fpr);
     }
   }
-  return session_status_load_incoming_keys(status);
+  return skt_session_load_incoming_keys(skt);
 }
 
 /* look through the incoming data stream and if it contains a key, try
    to ingest it.  FIXME: it's a bit wasteful to perform this scan of
    the whole buffer every time a TLS record comes in; should really be
-   done in true async form, with the state stored in status someplace. */
-int session_status_try_incoming_keys(struct session_status *status) {
-  unsigned char *key = status->incomingkey.data;
-  size_t sz = status->incomingkeylen;
+   done in true async form, with the state stored in skt someplace. */
+int skt_session_try_incoming_keys(skt_st *skt) {
+  unsigned char *key = skt->incomingkey.data;
+  size_t sz = skt->incomingkeylen;
   size_t consumed = 0;
   unsigned char *end;
   int rc;
@@ -1067,7 +1067,7 @@ int session_status_try_incoming_keys(struct session_status *status) {
       return EINVAL;
     /* at this point, POS points to the end of what we suspect to be an
        OpenPGP transferable private key. */
-    if ((rc = session_status_ingest_key(status, key, pos))) {
+    if ((rc = skt_session_ingest_key(skt, key, pos))) {
       ret = rc;
     }
     consumed += pos;
@@ -1075,79 +1075,79 @@ int session_status_try_incoming_keys(struct session_status *status) {
     sz -= pos;
   }
   if (consumed) {
-    size_t leftovers = status->incomingkeylen - consumed;
+    size_t leftovers = skt->incomingkeylen - consumed;
     if (leftovers)
-      memmove(status->incomingkey.data, status->incomingkey.data + consumed, leftovers);
-    status->incomingkeylen = leftovers;
+      memmove(skt->incomingkey.data, skt->incomingkey.data + consumed, leftovers);
+    skt->incomingkeylen = leftovers;
   }
   return ret;
 }
 
-int session_status_ingest_packet(struct session_status *status, gnutls_packet_t packet) {
+int skt_session_ingest_packet(skt_st *skt, gnutls_packet_t packet) {
   gnutls_datum_t data;
   int rc;
 
   assert(packet);
   gnutls_packet_get(packet, &data, NULL);
-  if ((rc = append_data(&status->incomingkey, &data, status->incomingkeylen))) {
+  if ((rc = append_data(&skt->incomingkey, &data, skt->incomingkeylen))) {
     fprintf(stderr, "Failed to append data: (%d) %s\n", rc, strerror(rc));
     return rc;
   }
-  status->incomingkeylen += data.size;
-  return session_status_try_incoming_keys(status);
+  skt->incomingkeylen += data.size;
+  return skt_session_try_incoming_keys(skt);
 }
 
-void session_status_read_cb(uv_stream_t* stream, ssize_t nread, const uv_buf_t* buf) {
-  struct session_status *status = stream->data;
+void skt_session_read_cb(uv_stream_t* stream, ssize_t nread, const uv_buf_t* buf) {
+  skt_st *skt = stream->data;
   int rc;
-  assert(stream == (uv_stream_t*)(&status->accepted_socket));
-  assert(buf->base == status->tlsreadbuf + status->end);
-  status->end += nread;
+  assert(stream == (uv_stream_t*)(&skt->accepted_socket));
+  assert(buf->base == skt->tlsreadbuf + skt->end);
+  skt->end += nread;
 
-  if (!status->handshake_done) {
+  if (!skt->handshake_done) {
     gnutls_alert_description_t alert;
-    rc = gnutls_handshake(status->session);
+    rc = gnutls_handshake(skt->session);
     switch(rc) {
     case GNUTLS_E_WARNING_ALERT_RECEIVED:
-      alert = gnutls_alert_get(status->session);
+      alert = gnutls_alert_get(skt->session);
       fprintf(stderr, "Got GnuTLS alert (%d) %s\n", alert, gnutls_alert_get_name(alert));
       break;
     case GNUTLS_E_INTERRUPTED:
     case GNUTLS_E_AGAIN:
-      if (status->log_level > 3)
+      if (skt->log_level > 3)
         fprintf(stderr, "gnutls_handshake() got (%d) %s\n", rc, gnutls_strerror(rc));
       break;
     case GNUTLS_E_SUCCESS:
-      session_status_handshake_done(status);
+      skt_session_handshake_done(skt);
       break;
     default:
-      its_all_over(status, "gnutls_handshake() got (%d) %s, fatal\n", rc, gnutls_strerror(rc));
+      its_all_over(skt, "gnutls_handshake() got (%d) %s, fatal\n", rc, gnutls_strerror(rc));
     }
   } else while (1) {
     gnutls_packet_t packet = NULL;
-    assert(status->session);
-    rc = gnutls_record_recv_packet(status->session, &packet);
+    assert(skt->session);
+    rc = gnutls_record_recv_packet(skt->session, &packet);
     if (rc == GNUTLS_E_AGAIN)
       return;
     if (rc == 0) {
       /* This is EOF from the remote peer.  We'd like to handle a
          half-closed stream if we're the active peer */
       assert(packet == NULL);
-      if (status->active) {
-        if (status->log_level > 0) 
+      if (skt->active) {
+        if (skt->log_level > 0) 
           fprintf(stderr, "passive peer closed its side of the connection.\n");
       } else {
-        if (status->incomingdir) {
+        if (skt->incomingdir) {
           /* Now we've loaded as many of the keys as we will get.  We
              should now be in a mode where we ask the user to import
              them.  So we just need to close the TLS session and carry
              on. */
-          if (!session_status_close_tls(status)) {
+          if (!skt_session_close_tls(skt)) {
             fprintf(stderr, "Failed to close the TLS session!\n");
             return;
           }
         } else {
-          its_all_over(status, "TLS session closed with nothing transmitted from either side!\n");
+          its_all_over(skt, "TLS session closed with nothing transmitted from either side!\n");
           return;
         }
       }
@@ -1158,28 +1158,28 @@ void session_status_read_cb(uv_stream_t* stream, ssize_t nread, const uv_buf_t* 
         fprintf(stderr, "gnutls_record_recv_packet returned (%d) %s\n", rc, gnutls_strerror(rc));
       } else {
         /* this is an error */
-        its_all_over(status, "Got an error in gnutls_record_recv_packet: (%d) %s\n", rc, gnutls_strerror(rc));
+        its_all_over(skt, "Got an error in gnutls_record_recv_packet: (%d) %s\n", rc, gnutls_strerror(rc));
         return;
       }
     } else {
-      if (status->active) {
+      if (skt->active) {
         gnutls_packet_deinit(packet);
-        its_all_over(status, "We are the active sender, but the other side sent stuff\n");
+        its_all_over(skt, "We are the active sender, but the other side sent stuff\n");
         return;
       }
 
       /* we're now in passive mode.  */
-      if (!status->incomingdir) {
-        if (session_status_setup_incoming(status)) {
-          its_all_over(status, "Cannot import keys if the input is not an OpenPGP key\n");
+      if (!skt->incomingdir) {
+        if (skt_session_setup_incoming(skt)) {
+          its_all_over(skt, "Cannot import keys if the input is not an OpenPGP key\n");
           return;
         }
-        session_status_display_incoming_key_menu(status, stdout);
+        skt_session_display_incoming_key_menu(skt, stdout);
       }
 
-      if ((rc = session_status_ingest_packet(status, packet))) {
+      if ((rc = skt_session_ingest_packet(skt, packet))) {
         gnutls_packet_deinit(packet);
-        its_all_over(status, "failed to ingest the packet: (%d) %s\n", rc, strerror(rc));
+        its_all_over(skt, "failed to ingest the packet: (%d) %s\n", rc, strerror(rc));
         return;
       }
       gnutls_packet_deinit(packet);
@@ -1187,42 +1187,42 @@ void session_status_read_cb(uv_stream_t* stream, ssize_t nread, const uv_buf_t* 
   }
 }
 
-void session_status_cleanup_listener(uv_handle_t* handle) {
-  struct session_status *status = handle->data;
-  assert(handle == (uv_handle_t*)(&status->listen_socket));
+void skt_session_cleanup_listener(uv_handle_t* handle) {
+  skt_st *skt = handle->data;
+  assert(handle == (uv_handle_t*)(&skt->listen_socket));
   /* FIXME: do we need to clean up anything? */
 }
 
 
-void session_status_connect(uv_stream_t* server, int x) {
+void skt_session_connect(uv_stream_t* server, int x) {
   int rc;
-  struct session_status *status = server->data;
-  assert(server == (uv_stream_t*)(&status->listen_socket));
+  skt_st *skt = server->data;
+  assert(server == (uv_stream_t*)(&skt->listen_socket));
   if (x < 0) 
-    its_all_over(status, "connect callback called with status %d\n", x);
-  else if ((rc = uv_tcp_init(status->loop, &status->accepted_socket))) 
-    its_all_over(status, "failed to init accepted_socket: (%d) %s\n", rc, uv_strerror(rc));
+    its_all_over(skt, "connect callback called with status %d\n", x);
+  else if ((rc = uv_tcp_init(skt->loop, &skt->accepted_socket))) 
+    its_all_over(skt, "failed to init accepted_socket: (%d) %s\n", rc, uv_strerror(rc));
   else {
-    status->accepted_socket.data = status;
-    if ((rc = uv_accept(server, (uv_stream_t*)(&status->accepted_socket))))
-      its_all_over(status, "failed to init accepted_socket: (%d) %s\n", rc, uv_strerror(rc));
-    else if ((rc = uv_tcp_getpeername(&status->accepted_socket, (struct sockaddr*)(&status->sa_cli_storage),
-                                      &status->sa_cli_storage_sz)))
-      its_all_over(status, "failed to getpeername of connected host: (%d) %s\n", rc, uv_strerror(rc));
+    skt->accepted_socket.data = skt;
+    if ((rc = uv_accept(server, (uv_stream_t*)(&skt->accepted_socket))))
+      its_all_over(skt, "failed to init accepted_socket: (%d) %s\n", rc, uv_strerror(rc));
+    else if ((rc = uv_tcp_getpeername(&skt->accepted_socket, (struct sockaddr*)(&skt->sa_cli_storage),
+                                      &skt->sa_cli_storage_sz)))
+      its_all_over(skt, "failed to getpeername of connected host: (%d) %s\n", rc, uv_strerror(rc));
     else {
-      uv_close((uv_handle_t*)(&status->listen_socket), session_status_cleanup_listener);
+      uv_close((uv_handle_t*)(&skt->listen_socket), skt_session_cleanup_listener);
       
-      if (print_address_name(&status->sa_cli_storage, status->caddrp, sizeof(status->caddrp), &status->cport))
+      if (print_address_name(&skt->sa_cli_storage, skt->caddrp, sizeof(skt->caddrp), &skt->cport))
         return;
       fprintf(stdout, "A connection was made from %s%s%s:%d!\n",
-              status->sa_cli_storage.ss_family==AF_INET6?"[":"",
-              status->caddrp,
-              status->sa_cli_storage.ss_family==AF_INET6?"]":"",
-              status->cport
+              skt->sa_cli_storage.ss_family==AF_INET6?"[":"",
+              skt->caddrp,
+              skt->sa_cli_storage.ss_family==AF_INET6?"]":"",
+              skt->cport
               );
 
-      if ((rc = uv_read_start((uv_stream_t*)(&status->accepted_socket), session_status_alloc_cb, session_status_read_cb)))
-        its_all_over(status, "failed to uv_read_start: (%d) %s\n", rc, uv_strerror(rc));
+      if ((rc = uv_read_start((uv_stream_t*)(&skt->accepted_socket), skt_session_alloc_cb, skt_session_read_cb)))
+        its_all_over(skt, "failed to uv_read_start: (%d) %s\n", rc, uv_strerror(rc));
     }
   }
 }
@@ -1231,7 +1231,7 @@ void session_status_connect(uv_stream_t* server, int x) {
 
 
 int main(int argc, const char *argv[]) {
-  struct session_status *status;
+  skt_st *skt;
   uv_loop_t loop;
   int rc;
   gnutls_psk_server_credentials_t creds = NULL;
@@ -1264,26 +1264,26 @@ int main(int argc, const char *argv[]) {
     }
   }
 
-  status = session_status_new(&loop, log_level);
-  if (!status) {
-    fprintf(stderr, "Failed to initialize status object\n");
+  skt = skt_session_new(&loop, log_level);
+  if (!skt) {
+    fprintf(stderr, "Failed to initialize skt object\n");
     return -1;
   }
-  if (session_status_choose_address(status))
+  if (skt_session_choose_address(skt))
     return -1;
 
-  if (session_status_gather_secret_keys(status))
+  if (skt_session_gather_secret_keys(skt))
     return -1;
   
   /* open tls server connection */
-  if ((rc = gnutls_init(&status->session, GNUTLS_SERVER | GNUTLS_NONBLOCK))) {
+  if ((rc = gnutls_init(&skt->session, GNUTLS_SERVER | GNUTLS_NONBLOCK))) {
     fprintf(stderr, "failed to init session: (%d) %s\n", rc, gnutls_strerror(rc));
     return -1;
   }
-  gnutls_session_set_ptr(status->session, status);
-  gnutls_transport_set_pull_function(status->session, session_status_gnutls_pull_func);
-  gnutls_transport_set_push_function(status->session, session_status_gnutls_push_func);
-  gnutls_transport_set_ptr(status->session, status);
+  gnutls_session_set_ptr(skt->session, skt);
+  gnutls_transport_set_pull_function(skt->session, skt_session_gnutls_pull_func);
+  gnutls_transport_set_push_function(skt->session, skt_session_gnutls_push_func);
+  gnutls_transport_set_ptr(skt->session, skt);
   if ((rc = gnutls_psk_allocate_server_credentials(&creds))) {
     fprintf(stderr, "failed to allocate PSK credentials: (%d) %s\n", rc, gnutls_strerror(rc));
     return -1;
@@ -1296,7 +1296,7 @@ int main(int argc, const char *argv[]) {
     return -1;
   }
   gnutls_psk_set_server_credentials_function(creds, get_psk_creds);
-  if ((rc = gnutls_credentials_set(status->session, GNUTLS_CRD_PSK, creds))) {
+  if ((rc = gnutls_credentials_set(skt->session, GNUTLS_CRD_PSK, creds))) {
     fprintf(stderr, "failed to assign PSK credentials to GnuTLS server: (%d) %s\n", rc, gnutls_strerror(rc));
     return -1;
   }
@@ -1304,17 +1304,17 @@ int main(int argc, const char *argv[]) {
     fprintf(stderr, "failed to set up GnuTLS priority: (%d) %s\n", rc, gnutls_strerror(rc));
     return -1;
   }
-  if ((rc = gnutls_priority_set(status->session, priority_cache))) {
+  if ((rc = gnutls_priority_set(skt->session, priority_cache))) {
     fprintf(stderr, "failed to assign gnutls priority: (%d) %s\n", rc, gnutls_strerror(rc));
     return -1;
   }
 
   /* construct string */
   urlbuf[sizeof(urlbuf)-1] = 0;
-  urllen = snprintf(urlbuf, sizeof(urlbuf)-1, "%s://%s@%s%s%s:%d", schema, status->pskhex,
-                    status->sa_serv_storage.ss_family==AF_INET6?"[":"",
-                    status->addrp,
-                    status->sa_serv_storage.ss_family==AF_INET6?"]":"", status->port);
+  urllen = snprintf(urlbuf, sizeof(urlbuf)-1, "%s://%s@%s%s%s:%d", schema, skt->pskhex,
+                    skt->sa_serv_storage.ss_family==AF_INET6?"[":"",
+                    skt->addrp,
+                    skt->sa_serv_storage.ss_family==AF_INET6?"]":"", skt->port);
   if (urllen >= (sizeof(urlbuf)-1)) {
     fprintf(stderr, "buffer was somehow truncated.\n");
     return -1;
@@ -1339,9 +1339,9 @@ int main(int argc, const char *argv[]) {
   }
 
   /* for test purposes... */
-  if (status->log_level > 0)
+  if (skt->log_level > 0)
     fprintf(stdout, "gnutls-cli --debug %d --priority %s --port %d --pskusername %s --pskkey %s %s\n",
-            status->log_level, priority, status->port, psk_id_hint, status->pskhex, status->addrp);
+            skt->log_level, priority, skt->port, psk_id_hint, skt->pskhex, skt->addrp);
 
   if ((rc = uv_run(&loop, UV_RUN_DEFAULT))) {
     while ((rc = uv_run(&loop, UV_RUN_ONCE))) {
@@ -1353,7 +1353,7 @@ int main(int argc, const char *argv[]) {
   if (inkey) {
     /* FIXME: send key */
     char data[65536];
-    if (status->log_level > 3)
+    if (skt->log_level > 3)
       fprintf(stderr, "trying to write %s to client\n", (stdin == inkey) ? "standard input" : argv[1]);
 
     /* read from inkey, send to gnutls */
@@ -1364,12 +1364,12 @@ int main(int argc, const char *argv[]) {
         fprintf(stderr, "Error reading from input\n");
         return -1;
       } else {
-        if (status->log_level > 3)
+        if (skt->log_level > 3)
           fprintf(stderr, "trying to write %zd octets to client\n", r);
         while (r) {
           rc = GNUTLS_E_AGAIN;
           while (rc == GNUTLS_E_AGAIN || rc == GNUTLS_E_INTERRUPTED) {
-            rc = gnutls_record_send(status->session, data, r); /* FIXME: blocking */
+            rc = gnutls_record_send(skt->session, data, r); /* FIXME: blocking */
             if (rc < 0) {
               if (rc != GNUTLS_E_AGAIN && rc != GNUTLS_E_INTERRUPTED) {
                 fprintf(stderr, "gnutls_record_send() failed: (%d) %s\n", rc, gnutls_strerror(rc));
@@ -1385,7 +1385,7 @@ int main(int argc, const char *argv[]) {
   }
 
   /* cleanup */
-  session_status_free(status);
+  skt_session_free(skt);
   gnutls_priority_deinit(priority_cache);
   gnutls_psk_free_server_credentials(creds);
   QRcode_free(qrcode);
