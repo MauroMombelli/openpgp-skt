@@ -21,7 +21,7 @@
 #include <iwlib.h>
 
 const char * psk_id_hint = "openpgp-skt";
-const char schema[] = "OPENPGP+SKT";
+const char schema[] = "OPGPSKT";
 const char priority[] = "NORMAL:-CTYPE-ALL"
   ":%SERVER_PRECEDENCE:%NO_TICKETS"
   ":-VERS-TLS1.0:-VERS-TLS1.1:-VERS-DTLS1.0:-VERS-DTLS1.2"
@@ -586,7 +586,7 @@ int skt_session_choose_address(skt_st* skt) {
                 else {
                   fprintf(stderr, "(hex:)");
                   for (const char *c = cfg.essid; c < cfg.essid + cfg.essid_len; c++) 
-                    fprintf(stderr, "%02x", *c);
+                    fprintf(stderr, "%02X", *c);
                 }
                 fprintf(stderr, "\n");
               }
@@ -660,7 +660,7 @@ int skt_session_choose_address(skt_st* skt) {
     skt->essid = malloc(selected.essid_len * 2 + 1);
     if (skt->essid) {
       for (int ix = 0; ix < selected.essid_len; ix++)
-        sprintf(skt->essid + (ix * 2), "%02x", selected.essid[ix]);
+        sprintf(skt->essid + (ix * 2), "%02X", selected.essid[ix]);
       skt->essid[selected.essid_len * 2] = '\0';
     }
   }
@@ -1398,11 +1398,12 @@ int main(int argc, const char *argv[]) {
   
   /* construct string */
   urlbuf[sizeof(urlbuf)-1] = 0;
-  urllen = snprintf(urlbuf, sizeof(urlbuf)-1, "%s://%s@%s%s%s:%d%s%s", schema, skt->pskhex,
-                    skt->sa_serv_storage.ss_family==AF_INET6?"[":"",
+  urllen = snprintf(urlbuf, sizeof(urlbuf)-1, "%s:%s/%d/%s%s%s",
+                    schema,
                     skt->addrp,
-                    skt->sa_serv_storage.ss_family==AF_INET6?"]":"", skt->port,
-                    skt->essid ? "?SSID=" : "",
+                    skt->port,
+                    skt->pskhex,
+                    skt->essid ? "/SSID:" : "",
                     skt->essid ? skt->essid : "");
   if (urllen >= (sizeof(urlbuf)-1)) {
     fprintf(stderr, "buffer was somehow truncated.\n");
@@ -1414,8 +1415,8 @@ int main(int argc, const char *argv[]) {
   }
   fprintf(stdout, "%s\n", urlbuf);
       
-  /* generate qrcode (can't use QR_MODE_AN because of punctuation in URL) */
-  qrcode = QRcode_encodeString(urlbuf, 0, QR_ECLEVEL_L, QR_MODE_8, 0);
+  /* generate qrcode (FIXME: can't use QR_MODE_AN, because QRcode_encodeString only likes 8bit or kanji; need to invoke this differently) */
+  qrcode = QRcode_encodeString(urlbuf, 0, QR_ECLEVEL_L, QR_MODE_AN, 0);
   if (qrcode == NULL) {
     fprintf(stderr, "failed to encode string as QRcode: (%d) %s\n", errno, strerror(errno));
     return -1;
