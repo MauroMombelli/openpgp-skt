@@ -8,6 +8,10 @@ LDFLAGS += $(shell pkg-config --libs libqrencode gnutls libuv)
 CFLAGS += $(shell gpgme-config --cflags)
 LDFLAGS += $(shell gpgme-config --libs)
 
+# libiw ships no pkg-config file -- see
+# https://github.com/HewlettPackard/wireless-tools/issues/4
+LDFLAGS += -liw
+
 OBJECTS = skt-server
 
 all: skt-server

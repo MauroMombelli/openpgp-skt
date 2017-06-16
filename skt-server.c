@@ -18,6 +18,7 @@
 #include <unistd.h>
 #include <gpgme.h>
 #include <uv.h>
+#include <iwlib.h>
 
 const char * psk_id_hint = "openpgp-skt";
 const char schema[] = "OPENPGP+SKT";
@@ -84,6 +85,9 @@ struct skt_session {
   size_t keylist_offset;
   
   struct ifaddrs *ifap;
+  char *essid;
+  int iwcfgfd;
+  
   char tlsreadbuf[65536];
   size_t start;
   size_t end;
@@ -117,6 +121,10 @@ void skt_session_free(skt_st *skt) {
     }
     if (skt->ifap)
       freeifaddrs(skt->ifap);
+    if (skt->essid)
+      free(skt->essid);
+    if (skt->iwcfgfd >= 0)
+      iw_sockets_close(skt->iwcfgfd);
     free(skt);
   }
 }
@@ -453,6 +461,9 @@ skt_st * skt_session_new(uv_loop_t *loop, int log_level) {
     skt->log_level = log_level;
     skt->sa_serv_storage_sz = sizeof (skt->sa_serv_storage);
     skt->sa_cli_storage_sz = sizeof (skt->sa_cli_storage);
+    skt->iwcfgfd = iw_sockets_open();
+    if (skt->iwcfgfd < 0) /* non-fatal error */
+      fprintf(stderr, "Warning: unable to learn about wireless configuration\n"); 
 
     if ((gerr = gpgme_new(&skt->gpgctx))) {
       fprintf(stderr, "gpgme_new failed: (%d), %s\n", gerr, gpgme_strerror(gerr));
@@ -489,6 +500,9 @@ int skt_session_choose_address(skt_st* skt) {
   struct ifaddrs *ifa;
   struct sockaddr *myaddr = NULL;
   int myfamily = 0;
+  bool has_essid = false;
+  struct wireless_config cfg;
+  char essid[sizeof(cfg.essid)];
   int rc;
   /*  int optval = 1; */
   
@@ -497,6 +511,7 @@ int skt_session_choose_address(skt_st* skt) {
     fprintf(stderr, "getifaddrs failed: (%d) %s\n", errno, strerror(errno));
     return -1;
   }
+    
   for (ifa = skt->ifap; ifa; ifa = ifa->ifa_next) {
     char addrstring[INET6_ADDRSTRLEN];
     bool skip = false;
@@ -529,13 +544,60 @@ int skt_session_choose_address(skt_st* skt) {
       continue;
     }
     if (!skip) {
+      bool essid_ok = false;
+      if (skt->iwcfgfd >= 0) {
+        if (iw_get_basic_config(skt->iwcfgfd, ifa->ifa_name, &cfg)) {
+          if (errno == EOPNOTSUPP) {
+            if (skt->log_level > 2)
+              fprintf(stderr, "interface %s is not Wi-Fi\n", ifa->ifa_name);
+          } else {
+            fprintf(stderr, "failed to get wireless info: (%d) %s\n", errno, strerror(errno));
+          }
+        } else {
+          if (cfg.has_essid) {
+            if (cfg.essid_len >= sizeof(cfg.essid)) {
+              fprintf(stderr, "essid is longer (%d octets) than we can handle (%zd octets)\n",
+                      cfg.essid_len, sizeof(cfg.essid)-1);              
+            } else {
+              essid_ok = true;
+              
+              /* FIXME: is this trailing NUL byte necessary?  lack of docs for iwlib :( */
+              cfg.essid[cfg.essid_len] = '\0';
+              /* avoid un-URL-able symbols in the essid */
+              for (const char *c = cfg.essid; c < cfg.essid + cfg.essid_len; c++) {
+                if (!(isascii(*c) && isgraph(*c) && (NULL == strchr("%&+", *c)))) {
+                  fprintf(stderr, "unprintable octet 0x%02x in essid, ignoring it\n", *c);
+                  essid_ok = false;
+                  break;
+                }
+              }
+              if (essid_ok) {
+                if (skt->log_level > 2)
+                  fprintf(stderr, "%s has ESSID: %s\n", ifa->ifa_name, cfg.essid);
+              }
+            }
+          } else {
+            fprintf(stderr, "Interface %s is wifi, but has no ESSID!\n", ifa->ifa_name);
+          }
+        }
+      }
       if (skt->log_level > 2)
         fprintf(stdout, "%s %s: %s (flags: 0x%x)\n", myaddr==NULL?"*":" ", ifa->ifa_name, addrstring, ifa->ifa_flags);
-      /* FIXME: we're just taking the first up, non-loopback address */
-      /* be cleverer about prefering wifi, preferring link-local addresses, and RFC1918 addressses. */
+      /* if a wifi NIC is up and has a printable ESSID, we'll take it.
+         Otherwise, we will just take the first up, non-loopback address */
+      /* FIXME: be cleverer about preferring link-local addresses, and RFC1918 addressses. */
       if (myaddr == NULL) {
         myfamily = family;
         myaddr = ifa->ifa_addr;
+        if (essid_ok) {
+          has_essid = true;
+          memcpy(essid, cfg.essid, sizeof(essid));
+        }
+      } else if (!has_essid && essid_ok) { /* prefer wifi */
+        myfamily = family;
+        myaddr = ifa->ifa_addr;
+        has_essid = true;
+        memcpy(essid, cfg.essid, sizeof(essid));
       }
     }
   }
@@ -579,6 +641,8 @@ int skt_session_choose_address(skt_st* skt) {
     fprintf(stderr, "failed to listen: (%d) %s\n", errno, strerror(errno));
     return -1;
   }
+  if (has_essid)
+    skt->essid = strdup(cfg.essid);
   return 0;
 }
 
