@@ -503,13 +503,14 @@ skt_st * skt_session_new(uv_loop_t *loop, int log_level) {
 
 int skt_session_choose_address(skt_st* skt) {
   struct ifaddrs *ifa;
-  struct wireless_config cfg;
+  struct wireless_config x; /* just for size info */
   struct {
     int myfamily;
     struct sockaddr *myaddr;
     bool has_essid;
+    size_t essid_len;
     bool is_wifi;
-    char essid[sizeof(cfg.essid)];
+    char essid[sizeof(x.essid)];
   } selected = { .myfamily = 0 };
   int rc;
   /*  int optval = 1; */
@@ -525,6 +526,7 @@ int skt_session_choose_address(skt_st* skt) {
     bool skip = false;
     int family = 0;
     bool is_wifi = false;
+    struct wireless_config cfg;
     
     if (ifa->ifa_addr) {
       family = ((struct sockaddr_storage*)(ifa->ifa_addr))->ss_family;
@@ -553,7 +555,6 @@ int skt_session_choose_address(skt_st* skt) {
       continue;
     }
     if (!skip) {
-      bool essid_ok = false;
       if (skt->iwcfgfd >= 0) {
         if (iw_get_basic_config(skt->iwcfgfd, ifa->ifa_name, &cfg)) {
           if (errno == EOPNOTSUPP) {
@@ -569,21 +570,25 @@ int skt_session_choose_address(skt_st* skt) {
               fprintf(stderr, "essid is longer (%d octets) than we can handle (%zd octets)\n",
                       cfg.essid_len, sizeof(cfg.essid)-1);              
             } else {
-              essid_ok = true;
-              
-              /* FIXME: is this trailing NUL byte necessary?  lack of docs for iwlib :( */
-              cfg.essid[cfg.essid_len] = '\0';
-              /* avoid un-URL-able symbols in the essid */
-              for (const char *c = cfg.essid; c < cfg.essid + cfg.essid_len; c++) {
-                if (!(isascii(*c) && isgraph(*c) && (NULL == strchr("%&+", *c)))) {
-                  fprintf(stderr, "unprintable octet 0x%02x in essid, ignoring it\n", *c);
-                  essid_ok = false;
-                  break;
+              if (skt->log_level > 2) {
+                bool essid_printable = true;
+                /* avoid un-URL-able symbols in the essid */
+                for (const char *c = cfg.essid; c < cfg.essid + cfg.essid_len; c++) {
+                  if (!(isascii(*c) && isgraph(*c) && (NULL == strchr("%&+", *c)))) {
+                    fprintf(stderr, "unprintable octet 0x%02x in essid, we will not log it raw\n", *c);
+                    essid_printable = false;
+                    break;
+                  }
                 }
-              }
-              if (essid_ok) {
-                if (skt->log_level > 2)
-                  fprintf(stderr, "%s has ESSID: %s\n", ifa->ifa_name, cfg.essid);
+                fprintf(stderr, "%s has ESSID: ", ifa->ifa_name);
+                if (essid_printable) 
+                  fwrite(cfg.essid, cfg.essid_len, 1, stderr);
+                else {
+                  fprintf(stderr, "(hex:)");
+                  for (const char *c = cfg.essid; c < cfg.essid + cfg.essid_len; c++) 
+                    fprintf(stderr, "%02x", *c);
+                }
+                fprintf(stderr, "\n");
               }
             }
           } else {
@@ -596,16 +601,17 @@ int skt_session_choose_address(skt_st* skt) {
       /* FIXME: be cleverer about preferring link-local addresses, and RFC1918 addressses. */
       bool takeit = selected.myaddr == NULL ||
         (is_wifi && (!selected.is_wifi ||
-                     (essid_ok && !selected.has_essid)));
+                     (cfg.has_essid && !selected.has_essid)));
       if (skt->log_level > 2)
         fprintf(stdout, "%s %s: %s (flags: 0x%x)\n", takeit?"*":" ", ifa->ifa_name, addrstring, ifa->ifa_flags);
       if (takeit) {
         selected.myfamily = family;
         selected.myaddr = ifa->ifa_addr;
         selected.is_wifi = is_wifi;
-        if (essid_ok) {
+        if (cfg.has_essid) {
           selected.has_essid = true;
           memcpy(selected.essid, cfg.essid, sizeof(selected.essid));
+          selected.essid_len = cfg.essid_len;
         }
       }
     }
@@ -650,8 +656,14 @@ int skt_session_choose_address(skt_st* skt) {
     fprintf(stderr, "failed to listen: (%d) %s\n", errno, strerror(errno));
     return -1;
   }
-  if (selected.has_essid)
-    skt->essid = strdup(cfg.essid);
+  if (selected.has_essid) {
+    skt->essid = malloc(selected.essid_len * 2 + 1);
+    if (skt->essid) {
+      for (int ix = 0; ix < selected.essid_len; ix++)
+        sprintf(skt->essid + (ix * 2), "%02x", selected.essid[ix]);
+      skt->essid[selected.essid_len * 2] = '\0';
+    }
+  }
   return 0;
 }
 
