@@ -1386,10 +1386,12 @@ int main(int argc, const char *argv[]) {
   
   /* construct string */
   urlbuf[sizeof(urlbuf)-1] = 0;
-  urllen = snprintf(urlbuf, sizeof(urlbuf)-1, "%s://%s@%s%s%s:%d", schema, skt->pskhex,
+  urllen = snprintf(urlbuf, sizeof(urlbuf)-1, "%s://%s@%s%s%s:%d%s%s", schema, skt->pskhex,
                     skt->sa_serv_storage.ss_family==AF_INET6?"[":"",
                     skt->addrp,
-                    skt->sa_serv_storage.ss_family==AF_INET6?"]":"", skt->port);
+                    skt->sa_serv_storage.ss_family==AF_INET6?"]":"", skt->port,
+                    skt->essid ? "?SSID=" : "",
+                    skt->essid ? skt->essid : "");
   if (urllen >= (sizeof(urlbuf)-1)) {
     fprintf(stderr, "buffer was somehow truncated.\n");
     return -1;
