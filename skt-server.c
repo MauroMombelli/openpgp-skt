@@ -1321,8 +1321,9 @@ int main(int argc, const char *argv[]) {
   int rc;
   gnutls_psk_server_credentials_t creds = NULL;
   gnutls_priority_t priority_cache;
-  char urlbuf[INET6_ADDRSTRLEN + 25 + 32];
+  char urlbuf[INET6_ADDRSTRLEN + 1024];
   int urllen;
+  QRinput *qrinput = NULL;
   QRcode *qrcode = NULL;
   FILE * inkey = NULL;
   const char *ll;
@@ -1416,7 +1417,16 @@ int main(int argc, const char *argv[]) {
   fprintf(stdout, "%s\n", urlbuf);
       
   /* generate qrcode (FIXME: can't use QR_MODE_AN, because QRcode_encodeString only likes 8bit or kanji; need to invoke this differently) */
-  qrcode = QRcode_encodeString(urlbuf, 0, QR_ECLEVEL_L, QR_MODE_AN, 0);
+  qrinput = QRinput_new();
+  if (!qrinput) {
+    fprintf(stderr, "Failed to allocate new QRinput\n");
+    return -1;
+  }
+  if ((rc = QRinput_append(qrinput, QR_MODE_AN, strlen(urlbuf), (unsigned char *)urlbuf))) {
+    fprintf(stderr, "failed to QRinput_append: (%d) %s\n", rc == -1 ? errno: rc, strerror(rc == -1 ? errno : rc));
+    return -1;
+  }
+  qrcode = QRcode_encodeInput(qrinput);
   if (qrcode == NULL) {
     fprintf(stderr, "failed to encode string as QRcode: (%d) %s\n", errno, strerror(errno));
     return -1;
@@ -1479,6 +1489,7 @@ int main(int argc, const char *argv[]) {
   gnutls_priority_deinit(priority_cache);
   gnutls_psk_free_server_credentials(creds);
   QRcode_free(qrcode);
+  QRinput_free(qrinput);
   if ((rc == uv_loop_close(&loop)))
     fprintf(stderr, "uv_loop_close() returned (%d) %s\n", rc, uv_strerror(rc));
   return 0;
