@@ -34,10 +34,11 @@ const char pgp_end[] = "\n-----END PGP PRIVATE KEY BLOCK-----";
 
 #define ANSI_ESC "\x1b["
 #define PSK_BYTES 16
+#define KEYS_PER_PAGE 8
 
 typedef struct skt_session skt_st;
 
-struct imported_key {
+struct gpgkey {
   char *fpr;
   gpgme_key_t key;
   bool refresh;
@@ -48,13 +49,29 @@ int print_address_name(struct sockaddr_storage *addr, char *paddr, size_t paddrs
 void its_all_over(skt_st *skt, const char *fmt, ...);
 void skt_session_connect(uv_stream_t* server, int status);
 int skt_session_gather_secret_keys(skt_st *skt);
-void skt_session_release_all_gpg_keys(skt_st *skt);
-void skt_session_display_key_menu(skt_st *skt, FILE *f);
-void skt_session_display_incoming_key_menu(skt_st *skt, FILE *f);
 int skt_session_close_tls(skt_st *skt);
 int skt_session_import_incoming_key(skt_st *skt, gpgme_key_t k);
 int recursive_unlink(const char *pathname, int log_level);
 void clearscreen(FILE *f);
+
+
+struct gpgsession {
+  gpgme_ctx_t ctx;
+  char *homedir; /* NULL if the default */
+  struct gpgkey *keys;
+  size_t num_keys;
+  size_t keylist_offset;
+  char base_key;
+  const char *name;
+
+  /* what functions can happen?
+   * display
+   * respond to keypress */
+};
+
+void gpgsession_free(struct gpgsession *session, int log_level);
+struct gpgsession * gpgsession_new(bool ephemeral, char base_key, const char *name);
+void gpgsession_display(struct gpgsession *session, FILE *f);
 
 struct skt_session {
   uv_loop_t *loop;
@@ -71,19 +88,13 @@ struct skt_session {
   int sa_serv_storage_sz;
   int sa_cli_storage_sz;
   gnutls_session_t session;
-  gpgme_ctx_t gpgctx;
-  gpgme_ctx_t incoming;
-  char *incomingdir;
+  
   gnutls_datum_t incomingkey;
   size_t incomingkeylen;
 
-  struct imported_key *inkeys;
-  size_t num_inkeys;
-  size_t inkeylist_offset;
-  
-  gpgme_key_t *keys;
-  size_t num_keys;
-  size_t keylist_offset;
+  struct gpgsession *base;
+  struct gpgsession *incoming;
+  struct gpgsession *fromfile;
   
   struct ifaddrs *ifap;
   char *essid;
@@ -101,21 +112,12 @@ struct skt_session {
 
 void skt_session_free(skt_st *skt) {
   if (skt) {
-    skt_session_release_all_gpg_keys(skt);
-    if (skt->gpgctx)
-      gpgme_release(skt->gpgctx);
+    if (skt->base)
+      gpgsession_free(skt->base, skt->log_level);
     if (skt->incoming)
-      gpgme_release(skt->incoming);
+      gpgsession_free(skt->incoming, skt->log_level);
     if (skt->incomingkey.data) {
       free(skt->incomingkey.data);
-    }
-    if (skt->incomingdir) {
-      /* FIXME: really tear down the ephemeral homedir */
-      if (recursive_unlink(skt->incomingdir, skt->log_level))
-        fprintf(stderr, "failed to recursively remove ('%s'): (%d) %s\n", skt->incomingdir, errno, strerror(errno));
-
-      /* FIXME: should we also try to kill all running daemons?*/
-      free(skt->incomingdir);
     }
     if (skt->session) {
       skt_session_close_tls(skt);
@@ -130,6 +132,177 @@ void skt_session_free(skt_st *skt) {
   }
 }
 
+
+void gpgsession_free(struct gpgsession *session, int log_level) {
+  if (!session)
+    return;
+  if (session->keys) {
+    for (int ix = 0; ix < session->num_keys; ix++)
+      gpgme_key_unref(session->keys[ix].key);
+    free(session->keys);
+  }
+  if (session->ctx)
+    gpgme_release(session->ctx);
+  if (session->homedir) {
+    /* Really tear down the ephemeral homedir -- yikes! */
+    if (recursive_unlink(session->homedir, log_level))
+      fprintf(stderr, "failed to recursively remove ('%s'): (%d) %s\n", session->homedir, errno, strerror(errno));
+    
+    /* FIXME: should we also try to kill all running daemons?*/
+    free(session->homedir);
+  }
+  free(session);
+}
+
+bool gpgsession_can_handle_keypress(struct gpgsession *session, char key) {
+  if (key == 'n' && session->num_keys > KEYS_PER_PAGE)
+    return true;
+  /* only accept if we're on a page with sufficient keys */
+  if (key >= session->base_key && key < session->base_key + KEYS_PER_PAGE)
+    return (session->keylist_offset + (key - session->base_key)) < session->num_keys;
+  return false;
+}
+
+struct gpgkey * gpgsession_fetch_key(struct gpgsession *session, char key) {
+  if (key == 'n')  {
+    if (session->num_keys <= KEYS_PER_PAGE)
+      fprintf(stderr, "No more keys to display\n");
+    else {
+      session->keylist_offset += 8;
+      if (session->keylist_offset >= session->num_keys)
+        session->keylist_offset = 0;
+      gpgsession_display(session, stdout);
+    }
+    return NULL;
+  }
+  if (key >= session->base_key && key < session->base_key + KEYS_PER_PAGE) {
+    int kx = (session->keylist_offset + (key - session->base_key));
+    if (kx >= session->num_keys) {
+      fprintf(stderr, "not enough keys available for %s (wanted #%d, have %zd)!", session->name, kx, session->num_keys);
+    } else {
+      return session->keys + kx;
+    }      
+  }
+  return NULL;
+}
+
+
+
+
+int gpgsession_add_key(struct gpgsession *session, gpgme_key_t key) {
+  session->num_keys++;
+  struct gpgkey * update = realloc(session->keys, sizeof(session->keys[0]) * session->num_keys);
+  if (!update) {
+    fprintf(stderr, "out of memory allocating new gpgme_key_t\n");
+    return -1;
+  }
+  
+  session->keys = update;
+  session->keys[session->num_keys-1].key = key;
+  session->keys[session->num_keys-1].fpr = strdup(key->fpr);
+  session->keys[session->num_keys-1].refresh = false;
+  gpgme_key_ref(key);
+  return 0;
+}
+
+int gpgsession_add_fpr(struct gpgsession *session, const char *fpr) {
+  /* check if we already have it */
+  for (int ix = 0; ix < session->num_keys; ix++) {
+    if (!strcmp(session->keys[ix].fpr, fpr)) {
+      session->keys[ix].refresh = true;
+      return 0;
+    }
+  }
+
+  session->num_keys++;
+  struct gpgkey * update = realloc(session->keys, sizeof(session->keys[0]) * session->num_keys);
+  if (!update) {
+    fprintf(stderr, "out of memory allocating new gpgme_key_t\n");
+    return -1;
+  }
+  
+  session->keys = update;
+  session->keys[session->num_keys-1].key = NULL;
+  session->keys[session->num_keys-1].fpr = strdup(fpr);
+  session->keys[session->num_keys-1].refresh = true;
+  return 0;
+}
+
+struct gpgsession * gpgsession_new(bool ephemeral, char base_key, const char *name) {
+  struct gpgsession *ret;
+  gpgme_error_t gerr;
+  int rc;
+  char *xdg = NULL;
+  bool xdgf = false;
+  ret = calloc(1, sizeof(struct gpgsession));
+  if (!ret)
+    return NULL;
+
+  if (ephemeral) {
+    xdg = getenv("XDG_RUNTIME_DIR");
+    if (xdg == NULL) {
+      rc = asprintf(&xdg, "/run/user/%d", getuid());
+      if (rc == -1) {
+        fprintf(stderr, "failed to guess user ID during ephemeral GnuPG setup.\r\n");
+        goto fail;
+      }
+      xdgf = true;
+    }
+
+    if (F_OK != access(xdg, W_OK)) {
+      fprintf(stderr, "We don't have write access to '%s' for GnuPG ephemeral dir, falling back...\n", xdg);
+      free(xdg);
+      xdgf = false;
+      xdg = getenv("TMPDIR");
+      if (xdg == NULL || (F_OK != access(xdg, W_OK))) {
+        if (xdg != NULL)
+          fprintf(stderr, "We don't have write access to $TMPDIR ('%s') for GnuPG ephemeral dir, falling back to /tmp\n", xdg);
+        xdg = "/tmp";
+      }
+    }
+    
+    rc = asprintf(&ret->homedir, "%s/skt-server.XXXXXX", xdg);
+    if (rc == -1) {
+      fprintf(stderr, "Failed to allocate ephemeral GnuPG directory name in %s\n", xdg);
+      goto fail;
+    }
+    if (NULL == mkdtemp(ret->homedir)) {
+      fprintf(stderr, "failed to generate an ephemeral GnuPG homedir from template '%s'\n", ret->homedir);
+      goto fail;
+    }
+  }
+    
+  if ((gerr = gpgme_new(&ret->ctx))) {
+    fprintf(stderr, "gpgme_new failed when setting up ephemeral incoming directory: (%d), %s\n",
+            gerr, gpgme_strerror(gerr));
+    goto fail;
+  }
+  if ((gerr = gpgme_ctx_set_engine_info(ret->ctx, GPGME_PROTOCOL_OpenPGP, NULL, ret->homedir))) {
+    fprintf(stderr, "gpgme_ctx_set_engine_info failed%s%s%s: (%d), %s\n",
+            ephemeral?" ephemeral (":"",
+            ephemeral?ret->homedir:"",
+            ephemeral?")":"",
+            gerr, gpgme_strerror(gerr));
+    goto fail;
+  }
+  gpgme_set_armor(ret->ctx, 1);
+
+  ret->base_key = base_key;
+  ret->name = name;
+  return ret;
+ fail:
+  if (xdgf)
+    free(xdg);
+  if (ret) {
+    if (ret->homedir) {
+      if (rmdir(ret->homedir))
+        fprintf(stderr, "failed to rmdir('%s'): (%d) %s\n", ret->homedir, errno, strerror(errno));
+      free(ret->homedir);
+    }
+    free(ret);
+  }
+  return NULL;
+}
 
 int recursive_unlink(const char *path, int log_level) {
   int rc;
@@ -236,9 +409,8 @@ int skt_session_import_incoming_key(skt_st *skt, gpgme_key_t k) {
     }
     return rc;
   }
-  gpgme_set_armor(skt->incoming, 1);
 
-  gerr = gpgme_op_export(skt->incoming, pattern, mode, d[1]);
+  gerr = gpgme_op_export(skt->incoming->ctx, pattern, mode, d[1]);
   gpgme_data_release(d[1]);
   close(fds[1]);
   free(pattern);
@@ -249,7 +421,7 @@ int skt_session_import_incoming_key(skt_st *skt, gpgme_key_t k) {
     return EIO;
   }
 
-  gerr = gpgme_op_import(skt->gpgctx, d[0]);
+  gerr = gpgme_op_import(skt->base->ctx, d[0]);
   gpgme_data_release(d[0]);
   close(fds[0]);
   if (gerr) {
@@ -257,7 +429,7 @@ int skt_session_import_incoming_key(skt_st *skt, gpgme_key_t k) {
             gerr, gpgme_strerror(gerr));
     return EIO;
   }
-  gpgme_import_result_t result = gpgme_op_import_result(skt->gpgctx);
+  gpgme_import_result_t result = gpgme_op_import_result(skt->base->ctx);
   if (!result) {
     fprintf(stderr, "failure to get gpgme_op_import_result().\n");
     return EIO;
@@ -291,7 +463,6 @@ int skt_session_send_key(skt_st *skt, gpgme_key_t key) {
   gpgme_data_t data = NULL;
 
   skt->active = true;
-  gpgme_set_armor(skt->gpgctx, 1);
   rc = asprintf(&pattern, "0x%s", key->fpr);
   if (rc == -1) {
     fprintf(stderr, "failed to malloc appropriately!\n");
@@ -303,7 +474,7 @@ int skt_session_send_key(skt_st *skt, gpgme_key_t key) {
     return -1;
   }
   /* FIXME: blocking! */
-  if ((gerr = gpgme_op_export(skt->gpgctx, pattern, mode, data))) {
+  if ((gerr = gpgme_op_export(skt->base->ctx, pattern, mode, data))) {
     free(pattern);
     fprintf(stderr, "failed to export key: (%d) %s\n", gerr, gpgme_strerror(gerr));
     return -1;
@@ -333,7 +504,6 @@ void quit(skt_st *skt) {
 
 void input_read_cb(uv_stream_t* stream, ssize_t nread, const uv_buf_t* buf) {
   skt_st *skt = stream->data;
-  int rc;
   if (nread > 0) {
     int c = buf->base[0];
     if (c == 3) {
@@ -344,33 +514,21 @@ void input_read_cb(uv_stream_t* stream, ssize_t nread, const uv_buf_t* buf) {
       ctrl_l(skt);
     } else if (tolower(c) == 'q' || c == 0x1B /* ESC */) {
       quit(skt);
-    } else if (skt->incomingdir) {
-      if (c >= '0' && c <= '9') {
-        fprintf(stderr, "The other device is already sending keys.\nQuit and reconnect to push keys the other way.\n");
-      } else if (c >= 'a' && c <= ('a' + 7)) {
-        int x = (c - 'a') + skt->inkeylist_offset;
-        if ((rc = skt_session_import_incoming_key(skt, skt->inkeys[x].key)))
-          fprintf(stderr, "failed to import key: (%d) %s\n", rc, strerror(rc));
-      } else if (c == 'n') {
-        if (skt->num_inkeys < 9)
-          fprintf(stderr, "No more keys to display\n");
-        skt->inkeylist_offset += 8;
-        if (skt->inkeylist_offset >= skt->num_inkeys)
-          skt->inkeylist_offset = 0;
-        skt_session_display_incoming_key_menu(skt, stdout);
+    } else if (skt->incoming) {
+      if (gpgsession_can_handle_keypress(skt->incoming, c)) {
+        struct gpgkey *k = gpgsession_fetch_key(skt->incoming, c);
+        if (k) {
+          if (skt_session_import_incoming_key(skt, k->key)) {
+            fprintf(stderr, "Failed to import key with fingeprint %s!\n", k->fpr);
+          }
+        }
       }
+    } else if (gpgsession_can_handle_keypress(skt->base, c)) {
+      struct gpgkey *k = gpgsession_fetch_key(skt->base, c);
+      if (k)
+        skt_session_send_key(skt, k->key);
     } else if (c == '0') {
       fprintf(stderr, "FIXME: sending a file from active mode is not yet implemented!\n");
-    } else if (c >= '1' && c <= '8') {
-      int x = (c-'1') + skt->keylist_offset;
-      skt_session_send_key(skt, skt->keys[x]);
-    } else if (c == '9' || c == 'n') {
-      if (skt->num_keys < 9)
-        fprintf(stderr, "No more keys to display\n");
-      skt->keylist_offset += 8;
-      if (skt->keylist_offset >= skt->num_keys)
-        skt->keylist_offset = 0;
-      skt_session_display_key_menu(skt, stdout);
     } else {
       if (skt->log_level > 2)
         fprintf(stderr, "Got %d (0x%02x) '%.1s'\n", buf->base[0], buf->base[0], isprint(buf->base[0])? buf->base : "_");
@@ -389,76 +547,9 @@ void input_close_cb(uv_handle_t *handle) {
     fprintf(stderr, "failed to switch input back to normal mode: (%d) %s\n", rc, uv_strerror(rc));
 }
 
-int skt_session_setup_incoming(skt_st *skt) {
-  gpgme_error_t gerr;
-  int rc;
-  char *xdg = getenv("XDG_RUNTIME_DIR");
-  bool xdgf = false;
-
-  assert(skt->incoming == NULL);
-  
-  if (xdg == NULL) {
-    rc = asprintf(&xdg, "/run/user/%d", getuid());
-    if (rc == -1) {
-      fprintf(stderr, "failed to guess user ID during ephemeral GnuPG setup.\r\n");
-      return -1;
-    }
-    xdgf = true;
-  }
-
-  if (F_OK != access(xdg, W_OK)) {
-    fprintf(stderr, "We don't have write access to '%s' for GnuPG ephemeral dir, falling back...\n", xdg);
-    free(xdg);
-    xdgf = false;
-    xdg = getenv("TMPDIR");
-    if (xdg == NULL || (F_OK != access(xdg, W_OK))) {
-      if (xdg != NULL)
-        fprintf(stderr, "We don't have write access to $TMPDIR ('%s') for GnuPG ephemeral dir, falling back to /tmp\n", xdg);
-      xdg = "/tmp";
-    }
-  }
-       
-  rc = asprintf(&skt->incomingdir, "%s/skt-server.XXXXXX", xdg);
-  if (rc == -1) {
-    fprintf(stderr, "Failed to allocate ephemeral GnuPG directory name in %s\n", xdg);
-    goto fail;
-  }
-  if (NULL == mkdtemp(skt->incomingdir)) {
-    fprintf(stderr, "failed to generate an ephemeral GnuPG homedir from template '%s'\n", skt->incomingdir);
-    free(skt->incomingdir);
-    skt->incomingdir = NULL;
-    goto fail;
-  }
-  
-  if ((gerr = gpgme_new(&skt->incoming))) {
-    fprintf(stderr, "gpgme_new failed when setting up ephemeral incoming directory: (%d), %s\n",
-            gerr, gpgme_strerror(gerr));
-    goto fail;
-  }
-  if ((gerr = gpgme_ctx_set_engine_info(skt->incoming, GPGME_PROTOCOL_OpenPGP, NULL, skt->incomingdir))) {
-    fprintf(stderr, "gpgme_ctx_set_engine_info failed for ephemeral homedir %s: (%d), %s\n", skt->incomingdir, gerr, gpgme_strerror(gerr));
-    goto fail;
-  }
-
-  if (xdgf)
-    free(xdg);
-  return 0;
- fail:
-  if (xdgf)
-    free(xdg);
-  if (skt->incomingdir) {
-    if (rmdir(skt->incomingdir))
-      fprintf(stderr, "failed to rmdir('%s'): (%d) %s\n", skt->incomingdir, errno, strerror(errno));
-    free(skt->incomingdir);
-    skt->incomingdir = NULL;
-  }
-  return -1;
-}
-
 skt_st * skt_session_new(uv_loop_t *loop, int log_level) {
   skt_st *skt = calloc(1, sizeof(skt_st));
   size_t pskhexsz = sizeof(skt->pskhex);
-  gpgme_error_t gerr = GPG_ERR_NO_ERROR;
   int rc;
   
   if (skt) {
@@ -470,12 +561,9 @@ skt_st * skt_session_new(uv_loop_t *loop, int log_level) {
     if (skt->iwcfgfd < 0) /* non-fatal error */
       fprintf(stderr, "Warning: unable to learn about wireless configuration\n"); 
 
-    if ((gerr = gpgme_new(&skt->gpgctx))) {
-      fprintf(stderr, "gpgme_new failed: (%d), %s\n", gerr, gpgme_strerror(gerr));
-      goto fail;
-    }
-    if ((gerr = gpgme_ctx_set_engine_info(skt->gpgctx, GPGME_PROTOCOL_OpenPGP, NULL, NULL))) {
-      fprintf(stderr, "gpgme_ctx_set_engine_info failed: (%d), %s\n", gerr, gpgme_strerror(gerr));
+    skt->base = gpgsession_new(false, '1', "base");
+    if (!skt->base) {
+      fprintf(stderr, "failed to prepare base GnuPG session\n");
       goto fail;
     }
 
@@ -901,7 +989,7 @@ void skt_session_handshake_done(skt_st *skt) {
   } else {
     skt->input.data = skt;
   }
-  skt_session_display_key_menu(skt, stdout);
+  gpgsession_display(skt->base, stdout);
 }
 
 int skt_session_gather_secret_keys(skt_st *skt) {
@@ -909,23 +997,16 @@ int skt_session_gather_secret_keys(skt_st *skt) {
   int secret_only = 1;
   const char *pattern = NULL;
   fprintf(stdout, "Gathering a list of available OpenPGP secret keys...\n");
-  if ((gerr = gpgme_op_keylist_start(skt->gpgctx, pattern, secret_only))) {
+  if ((gerr = gpgme_op_keylist_start(skt->base->ctx, pattern, secret_only))) {
     fprintf(stderr, "Failed to start gathering keys: (%d) %s\n", gerr, gpgme_strerror(gerr));
     return 1;
   }
   while (!gerr) {
     gpgme_key_t key = NULL;
-    gerr = gpgme_op_keylist_next(skt->gpgctx, &key);
+    gerr = gpgme_op_keylist_next(skt->base->ctx, &key);
     if (!gerr) {
-      skt->num_keys++;
-      gpgme_key_t * update = realloc(skt->keys, sizeof(skt->keys[0]) * skt->num_keys);
-      if (update) {
-        skt->keys = update;
-        skt->keys[skt->num_keys-1] = key;
-      } else {
-        fprintf(stderr, "out of memory allocating new gpgme_key_t\n");
+      if (gpgsession_add_key(skt->base, key))
         goto fail;
-      }
     } else if (gpgme_err_code(gerr) != GPG_ERR_EOF) {
       fprintf(stderr, "Failed to get keys: (%d) %s\n", gerr, gpgme_strerror(gerr));
       goto fail;
@@ -933,77 +1014,42 @@ int skt_session_gather_secret_keys(skt_st *skt) {
   }
   return 0;
  fail:
-  if ((gerr = gpgme_op_keylist_end(skt->gpgctx)))
+  if ((gerr = gpgme_op_keylist_end(skt->base->ctx)))
     fprintf(stderr, "failed to gpgme_op_keylist_end(): (%d) %s\n", gerr, gpgme_strerror(gerr));
-  skt_session_release_all_gpg_keys(skt);
   return 1;
 }
 
-void skt_session_display_key_menu(skt_st *skt, FILE *f) {
-  int numleft = skt->num_keys - skt->keylist_offset;
-  if (numleft > 8)
-    numleft = 8;
-
-  if (!skt->num_keys)
-    fprintf(f, "You have no secret keys that you can send.\n");
-  fprintf(f, "To receive a key, ask the other device to send it.\n");
-
-  if (skt->num_keys) {
-    fprintf(f, "To send a key, press its number:\n\n");
-    for (int ix = 0; ix < numleft; ix++) {
-      fprintf(f, "[%d] %s\n    %s\n", (int)(1 + ix),
-              skt->keys[skt->keylist_offset + ix]->uids->uid,
-              skt->keys[skt->keylist_offset + ix]->fpr);
-    }
-    if (skt->num_keys > 8)
-      fprintf(f, "\n[9] …more available keys (%zd total)…\n", skt->num_keys);
-  }
-  fprintf(f, "[0] <choose a file to send>\n[q] to quit\n");
-}
-
-void skt_session_display_incoming_key_menu(skt_st *skt, FILE *f) {
-  int numleft = skt->num_inkeys - skt->inkeylist_offset;
-  if (numleft > 8)
-    numleft = 8;
-
-  if (!skt->num_inkeys) {
-    fprintf(f, "The other device has started sending keys, but no valid keys have arrived yet.\n");
-  } else {
-    fprintf(f, "To import a key, press its letter:\n\n");
-    for (int ix = 0; ix < numleft; ix++) {
-      fprintf(f, "[%c] %s\n", ('a' + ix),
-              skt->inkeys[skt->inkeylist_offset + ix].fpr);
-      for (gpgme_user_id_t uid = skt->inkeys[skt->inkeylist_offset + ix].key->uids; uid; uid = uid->next)
-        fprintf(f, "    %s\n", uid->uid);
-      fprintf(f, "\n");
-    }
-    if (skt->num_inkeys > 8)
-      fprintf(f, "\n[n] …more available keys (%zd total)…\n", skt->num_inkeys);
-  }
-  fprintf(f, "[q] to quit\n");
-}
 
 
-void skt_session_release_all_gpg_keys(skt_st *skt) {
-  if (skt->keys) {
-    for (int ix = 0; ix < skt->num_keys; ix++) {
-      gpgme_key_release(skt->keys[ix]);
-    }
-    free(skt->keys);
-    skt->keys = NULL;
-    skt->num_keys = 0;
-  }
-  if (skt->inkeys) {
-    for (int ix = 0; ix < skt->num_inkeys; ix++) {
-      free(skt->inkeys[ix].fpr);
-      gpgme_key_release(skt->inkeys[ix].key);
-    }
-    free(skt->inkeys);
-    skt->inkeys = NULL;
-    skt->num_inkeys = 0;
+void gpgsession_display(struct gpgsession *session, FILE *f) {
+  int numleft = session->num_keys - session->keylist_offset;
+  if (numleft > KEYS_PER_PAGE)
+    numleft = KEYS_PER_PAGE;
+
+  if (!strcmp(session->name, "base")) { /* FIXME: yuck! parameterize this */
+    if (!session->num_keys)
+      fprintf(f, "You have no secret keys that you can send.\n");
+    fprintf(f, "To receive a key, ask the other device to send it.\n");
+  } else if (!strcmp(session->name, "incoming")) {
+    if (!session->num_keys)
+      fprintf(f, "The other device has started sending keys, but no valid keys have arrived yet.\n");
   }
   
+  if (session->num_keys) {
+    fprintf(f, "To send a key, press its number:\n\n");
+    for (int ix = 0; ix < numleft; ix++) {
+      fprintf(f, "[%c] %s\n    %s\n", session->base_key + ix,
+              session->keys[session->keylist_offset + ix].key->uids->uid,
+              session->keys[session->keylist_offset + ix].fpr);
+    }
+    if (session->num_keys > KEYS_PER_PAGE)
+      fprintf(f, "\n[n] …more available keys (%zd total)…\n", session->num_keys);
+  }
+/*   fprintf(f, "[0] <choose a file to send>\n");  FIXME: prompt to load local keys from a file! */
+  fprintf(f, "[q] to quit\n");
+
 }
+
 
 /* appends SUFFIX to position POS in BASE, growing BASE if necessary */
 int append_data(gnutls_datum_t *base, const gnutls_datum_t *suffix, size_t pos) {
@@ -1019,45 +1065,20 @@ int append_data(gnutls_datum_t *base, const gnutls_datum_t *suffix, size_t pos) 
   return 0;
 }
 
-void skt_session_record_fingerprint(skt_st *skt, const char *fpr) {
-  /* check if we already have it */
-  for (int ix = 0; ix < skt->num_inkeys; ix++) {
-    if (!strcmp(skt->inkeys[ix].fpr, fpr)) {
-      skt->inkeys[ix].refresh = true;
-      return;
-    }
-  }
-
-  /* if we do not yet, then add it */
-  struct imported_key *newlist = realloc(skt->inkeys, sizeof(skt->inkeys[0])*(skt->num_inkeys+1));
-  if (!newlist) {
-    fprintf(stderr, "Failed to allocate more RAM for incoming key, skipping fingerprint %s\n", fpr);
-    return;
-  }
-  skt->inkeys = newlist;
-  struct imported_key *newkey = skt->inkeys + skt->num_inkeys;
-  skt->num_inkeys++;
-  newkey->fpr = strdup(fpr);
-  newkey->key = NULL;
-  newkey->refresh = true;
-  /* cannot grab info from gpgme ctx yet because we're still in the
-     gpgme_op_get_import_result :( */
-}
-
-int skt_session_load_incoming_keys(skt_st *skt) {
+int gpgsession_load_keys(struct gpgsession *gpg) {
   gpgme_error_t gerr;
   int secret = 1;
   int ret = 0;
   bool refreshed = false;
-  for (struct imported_key *k = skt->inkeys; k < skt->inkeys + skt->num_inkeys; k++) {
+  for (struct gpgkey *k = gpg->keys; k < gpg->keys + gpg->num_keys; k++) {
     if (k->key == NULL || k->refresh) {
       if (k->key) {
-        gpgme_key_release(k->key);
+        gpgme_key_unref(k->key);
         k->key = NULL;
       }
-      if ((gerr = gpgme_get_key(skt->incoming, k->fpr, &k->key, secret))) {
-        fprintf(stderr, "Failed to get incoming key with fingerprint %s: (%d) %s\n",
-                k->fpr, gerr, gpgme_strerror(gerr));
+      if ((gerr = gpgme_get_key(gpg->ctx, k->fpr, &k->key, secret))) {
+        fprintf(stderr, "Failed to get %s key with fingerprint %s: (%d) %s\n",
+                gpg->name, k->fpr, gerr, gpgme_strerror(gerr));
         ret = EIO;
       } else
         refreshed = true;
@@ -1065,7 +1086,7 @@ int skt_session_load_incoming_keys(skt_st *skt) {
   }
 
   if (refreshed)
-    skt_session_display_incoming_key_menu(skt, stdout);
+    gpgsession_display(gpg, stdout);
   return ret;
 }
 
@@ -1082,14 +1103,14 @@ int skt_session_ingest_key(skt_st *skt, unsigned char *ptr, size_t sz) {
     fprintf(stderr, "Failed to allocate new gpgme_data_t: (%d) %s\n", gerr, gpgme_strerror(gerr));
     return ENOMEM;
   }
-  gerr = gpgme_op_import(skt->incoming, d);
+  gerr = gpgme_op_import(skt->incoming->ctx, d);
   gpgme_data_release(d);
   if (gerr) {
     fprintf(stderr, "Failed to import key: (%d) %s\n", gerr, gpgme_strerror(gerr));
     return ENOMEM;
   }
 
-  result = gpgme_op_import_result(skt->incoming);
+  result = gpgme_op_import_result(skt->incoming->ctx);
   if (!result) {
     fprintf(stderr, "something went wrong during import to GnuPG\n");
     return EIO;
@@ -1100,10 +1121,10 @@ int skt_session_ingest_key(skt_st *skt, unsigned char *ptr, size_t sz) {
   for (newkey = result->imports; newkey; newkey = newkey->next) {
     if ((newkey->result == GPG_ERR_NO_ERROR) &&
         (newkey->status & (GPGME_IMPORT_NEW | GPGME_IMPORT_SECRET))) {
-      skt_session_record_fingerprint(skt, newkey->fpr);
+      gpgsession_add_fpr(skt->incoming, newkey->fpr);
     }
   }
-  return skt_session_load_incoming_keys(skt);
+  return gpgsession_load_keys(skt->incoming);
 }
 
 /* look through the incoming data stream and if it contains a key, try
@@ -1222,7 +1243,7 @@ void skt_session_read_cb(uv_stream_t* stream, ssize_t nread, const uv_buf_t* buf
         if (skt->log_level > 0) 
           fprintf(stderr, "passive peer closed its side of the connection.\n");
       } else {
-        if (skt->incomingdir) {
+        if (skt->incoming) {
           /* Now we've loaded as many of the keys as we will get.  We
              should now be in a mode where we ask the user to import
              them.  So we just need to close the TLS session and carry
@@ -1254,12 +1275,13 @@ void skt_session_read_cb(uv_stream_t* stream, ssize_t nread, const uv_buf_t* buf
       }
 
       /* we're now in passive mode.  */
-      if (!skt->incomingdir) {
-        if (skt_session_setup_incoming(skt)) {
-          its_all_over(skt, "Cannot import keys if the input is not an OpenPGP key\n");
+      if (!skt->incoming) {
+        skt->incoming = gpgsession_new(true, 'a', "incoming");
+        if (!skt->incoming) {
+          its_all_over(skt, "failed to prepare for key input\n");
           return;
         }
-        skt_session_display_incoming_key_menu(skt, stdout);
+        gpgsession_display(skt->incoming, stdout);
       }
 
       if ((rc = skt_session_ingest_packet(skt, packet))) {

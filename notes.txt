@@ -6,11 +6,6 @@ https://pad.stratum0.org/p/openpgp-skt
 TODO:
  * allow selection of IP address (and network interface)
 
- * hint at wifi SSID somehow?
-
  * improve visual effects for UI (e.g. clear the terminal before/after)
-
- * abstract out selecting from a list of keys; it is a very similar
-   workflow for imported keys as for selecting keys to export.
 
  * add zbarcam-style client work.
