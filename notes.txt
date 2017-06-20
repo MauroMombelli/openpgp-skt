@@ -8,5 +8,16 @@ TODO:
 
  * add zbarcam-style client work.
 
- * allow loading keys for export from a file, instead of from the
-   default GNUPGHOME.
+ * allow loading keys for export from a file if given as argv[1],
+   instead of from the default GNUPGHOME.
+
+ * on teardown, after a session is connected, something is weird with
+   gnutls_bye:
+
+gnutls_bye got error (-28) Resource temporarily unavailable, try again.
+UV_RUN_ONCE returned 1
+S:|<1>| Discarded message[32] due to invalid decryption
+Got an error in gnutls_record_recv_packet: (-24) Decryption has failed.
+gnutls_bye got error (-10) The specified session has been invalidated for some reason.
+gnutls_bye got error (-10) The specified session has been invalidated for some reason.
+uv_loop_close() returned (-16) resource busy or locked

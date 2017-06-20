@@ -50,6 +50,7 @@ void its_all_over(skt_st *skt, const char *fmt, ...);
 void skt_session_connect(uv_stream_t* server, int status);
 int skt_session_gather_secret_keys(skt_st *skt);
 int skt_session_close_tls(skt_st *skt);
+void skt_session_cleanup_listener(uv_handle_t* handle);
 int skt_session_import_incoming_key(skt_st *skt, gpgme_key_t k);
 int recursive_unlink(const char *pathname, int log_level);
 void clearscreen(FILE *f);
@@ -524,7 +525,7 @@ void input_read_cb(uv_stream_t* stream, ssize_t nread, const uv_buf_t* buf) {
           }
         }
       }
-    } else if (gpgsession_can_handle_keypress(skt->base, c)) {
+    } else if (skt->handshake_done && gpgsession_can_handle_keypress(skt->base, c)) {
       struct gpgkey *k = gpgsession_fetch_key(skt->base, c);
       if (k)
         skt_session_send_key(skt, k->key);
@@ -541,11 +542,15 @@ void input_read_cb(uv_stream_t* stream, ssize_t nread, const uv_buf_t* buf) {
     free(buf->base);
 }
 
+/* FIXME: tried to use this callback to do
+   uv_tty_set_mode(&skt->input, UV_TTY_MODE_NORMAL), but it kept
+   giving errors. */
 void input_close_cb(uv_handle_t *handle) {
   skt_st *skt = handle->data;
-  int rc;
-  if ((rc = uv_tty_set_mode(&skt->input, UV_TTY_MODE_NORMAL)))
-    fprintf(stderr, "failed to switch input back to normal mode: (%d) %s\n", rc, uv_strerror(rc));
+
+  if (skt->log_level > 5) {
+    fprintf(stderr, "input_close_cb()\n");
+  }
 }
 
 skt_st * skt_session_new(uv_loop_t *loop, int log_level) {
@@ -875,9 +880,13 @@ int print_address_name(struct sockaddr_storage *addr, char *paddr, size_t paddrs
 int skt_session_close_tls(skt_st *skt) {
   int rc;
   assert(skt->session);
-  if ((rc = gnutls_bye(skt->session, GNUTLS_SHUT_RDWR))) {
-    fprintf(stderr, "gnutls_bye got error (%d) %s\n", rc, gnutls_strerror(rc));
-    return -1;
+  if (skt->accepted_socket.data == skt) {
+    if ((rc = gnutls_bye(skt->session, GNUTLS_SHUT_RDWR))) {
+      fprintf(stderr, "gnutls_bye got error (%d) %s\n", rc, gnutls_strerror(rc));
+      return -1;
+    }
+  } else {
+    uv_close((uv_handle_t*)(&skt->listen_socket), skt_session_cleanup_listener);
   }
   gnutls_deinit(skt->session);
   skt->session = NULL;
@@ -927,15 +936,17 @@ ssize_t skt_session_gnutls_push_func(gnutls_transport_ptr_t ptr, const void* buf
   /* FIXME: be more asynchronous in writes; here we're just trying to be synchronous */
   
   /* FIXME: i do not like casting away constness here */
-  uv_buf_t b[] = {{ .base = (void*) buf, .len = sz }}; 
+  uv_buf_t b[] = {{ .base = (void*) buf, .len = sz }};
 
-  rc = uv_try_write((uv_stream_t*)(&skt->accepted_socket), b, sizeof(b)/sizeof(b[0]));
-  if (rc >= 0)
-    return rc;
-  fprintf(stderr, "got error %d (%s) when trying to write %zd octets\n", rc, uv_strerror(rc), sz);
-  if (rc == UV_EAGAIN) {
-    gnutls_transport_set_errno(skt->session, EAGAIN);
-    return -1;
+  if (skt->accepted_socket.data == skt) {
+    rc = uv_try_write((uv_stream_t*)(&skt->accepted_socket), b, sizeof(b)/sizeof(b[0]));
+    if (rc >= 0)
+      return rc;
+    fprintf(stderr, "got error %d (%s) when trying to write %zd octets\n", rc, uv_strerror(rc), sz);
+    if (rc == UV_EAGAIN) {
+      gnutls_transport_set_errno(skt->session, EAGAIN);
+      return -1;
+    }
   }
   gnutls_transport_set_errno(skt->session, EIO);
   return -1;
@@ -973,23 +984,10 @@ void skt_session_alloc_cb(uv_handle_t* handle, size_t suggested_size, uv_buf_t* 
 
 void skt_session_handshake_done(skt_st *skt) {
   char *desc;
-  int rc;
   desc = gnutls_session_get_desc(skt->session);
   fprintf(stdout, "TLS handshake complete: %s\n", desc);
   gnutls_free(desc);
   skt->handshake_done = true;
-  /* FIXME: should flush all input before starting to respond to it */
-  if ((rc = uv_tty_init(skt->loop, &skt->input, 0, 1))) {
-    fprintf(stderr, "failed to grab stdin for reading, using passive mode only: (%d) %s\n", rc, uv_strerror(rc));
-  } else if ((rc = uv_tty_set_mode(&skt->input, UV_TTY_MODE_RAW))) {
-    fprintf(stderr, "failed to switch input to raw mode, using passive mode only: (%d) %s\n", rc, uv_strerror(rc));
-    uv_close((uv_handle_t*)(&skt->input), input_close_cb);
-  } else if ((rc = uv_read_start((uv_stream_t*)(&skt->input), input_alloc_cb, input_read_cb))) {
-    fprintf(stderr, "failed to start reading from stdin, using passive mode only: (%d) %s\n", rc, uv_strerror(rc));
-    uv_close((uv_handle_t*)(&skt->input), input_close_cb);
-  } else {
-    skt->input.data = skt;
-  }
   gpgsession_display(skt->base, stdout);
 }
 
@@ -1467,6 +1465,19 @@ int main(int argc, const char *argv[]) {
     return -1;
   }
 
+  /* FIXME: should flush all input before starting to respond to it? */
+  if ((rc = uv_tty_init(skt->loop, &skt->input, 0, 1))) {
+    fprintf(stderr, "failed to grab stdin for reading, using passive mode only: (%d) %s\n", rc, uv_strerror(rc));
+  } else if ((rc = uv_tty_set_mode(&skt->input, UV_TTY_MODE_RAW))) {
+    fprintf(stderr, "failed to switch input to raw mode, using passive mode only: (%d) %s\n", rc, uv_strerror(rc));
+    uv_close((uv_handle_t*)(&skt->input), input_close_cb);
+  } else if ((rc = uv_read_start((uv_stream_t*)(&skt->input), input_alloc_cb, input_read_cb))) {
+    fprintf(stderr, "failed to start reading from stdin, using passive mode only: (%d) %s\n", rc, uv_strerror(rc));
+    uv_close((uv_handle_t*)(&skt->input), input_close_cb);
+  } else {
+    skt->input.data = skt;
+  }
+  
   /* for test purposes... */
   if (skt->log_level > 0)
     fprintf(stdout, "gnutls-cli --debug %d --priority %s --port %d --pskusername %s --pskkey %s %s\n",
@@ -1477,7 +1488,6 @@ int main(int argc, const char *argv[]) {
       fprintf(stderr, "UV_RUN_ONCE returned %d\n", rc);
     }
   }
-  fprintf(stderr, "Done with the loop\n");
 
   if (inkey) {
     /* FIXME: send key */
@@ -1519,7 +1529,7 @@ int main(int argc, const char *argv[]) {
   gnutls_psk_free_server_credentials(creds);
   QRcode_free(qrcode);
   QRinput_free(qrinput);
-  if ((rc == uv_loop_close(&loop)))
+  if ((rc = uv_loop_close(&loop)))
     fprintf(stderr, "uv_loop_close() returned (%d) %s\n", rc, uv_strerror(rc));
   return 0;
 }
