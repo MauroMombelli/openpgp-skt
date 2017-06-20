@@ -537,8 +537,6 @@ void input_read_cb(uv_stream_t* stream, ssize_t nread, const uv_buf_t* buf) {
       struct gpgkey *k = gpgsession_fetch_key(skt->base, c);
       if (k)
         skt_session_send_key(skt, k->key);
-    } else if (c == '0') {
-      fprintf(stderr, "FIXME: sending a file from active mode is not yet implemented!\n");
     } else {
       if (skt->log_level > 2)
         fprintf(stderr, "Got %d (0x%02x) '%.1s'\n", buf->base[0], buf->base[0], isprint(buf->base[0])? buf->base : "_");
@@ -911,7 +909,6 @@ void its_all_over(skt_st *skt, const char *fmt, ...) {
   va_start(ap, fmt);
   vfprintf(stderr, fmt, ap);
   va_end(ap);
-  /* FIXME: how to tear it all down? */
   if (skt->session) {
     skt_session_close_tls(skt);
   }
@@ -922,21 +919,6 @@ void its_all_over(skt_st *skt, const char *fmt, ...) {
   }
   uv_stop(skt->loop);
 }
-
-/* FIXME: this would only be used in the event of a fully asynchronous
-   write.  however, i don't see how to keep track of the memory being
-   written correctly in that case.
-
-void skt_session_write_done(uv_write_t* req, int x) {
-  if (x) {
-    fprintf(stderr, "write failed: (%d) %s\n", x, uv_strerror(x));
-    return;
-  }
-  skt_st *skt = req->handle->data;
-  
-  free(req);
-}
-*/
 
 ssize_t skt_session_gnutls_push_func(gnutls_transport_ptr_t ptr, const void* buf, size_t sz) {
   skt_st *skt = ptr;
@@ -987,7 +969,6 @@ void skt_session_alloc_cb(uv_handle_t* handle, size_t suggested_size, uv_buf_t* 
   assert(handle == (uv_handle_t*)(&skt->accepted_socket));
   buf->base = skt->tlsreadbuf + skt->end;
   buf->len = sizeof(skt->tlsreadbuf) - skt->end;
-  /* FIXME: should consider how to read partial buffers, if these don't match a TLS record */
 }
 
 void skt_session_handshake_done(skt_st *skt) {
@@ -1058,9 +1039,7 @@ void gpgsession_display(struct gpgsession *session, FILE *f) {
     if (session->num_keys > KEYS_PER_PAGE)
       fprintf(f, "\n[n] …more available keys (%zd total)…\n", session->num_keys);
   }
-/*   fprintf(f, "[0] <choose a file to send>\n");  FIXME: prompt to load local keys from a file! */
   fprintf(f, "[q] to quit\n");
-
 }
 
 
@@ -1488,7 +1467,6 @@ int main(int argc, const char *argv[]) {
   if (skt_session_show_qr(skt, stdout))
     return -1;
   
-  /* FIXME: should flush all input before starting to respond to it? */
   if ((rc = uv_tty_init(skt->loop, &skt->input, 0, 1))) {
     fprintf(stderr, "failed to grab stdin for reading, using passive mode only: (%d) %s\n", rc, uv_strerror(rc));
   } else if ((rc = uv_tty_set_mode(&skt->input, UV_TTY_MODE_RAW))) {
