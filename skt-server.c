@@ -48,7 +48,6 @@ int print_qrcode(FILE* f, const QRcode* qrcode);
 int print_address_name(struct sockaddr_storage *addr, char *paddr, size_t paddrsz, int *port);
 void its_all_over(skt_st *skt, const char *fmt, ...);
 void skt_session_connect(uv_stream_t* server, int status);
-int skt_session_gather_secret_keys(skt_st *skt);
 int skt_session_close_tls(skt_st *skt);
 void skt_session_cleanup_listener(uv_handle_t* handle);
 int skt_session_import_incoming_key(skt_st *skt, gpgme_key_t k);
@@ -114,10 +113,9 @@ struct skt_session {
 
 void skt_session_free(skt_st *skt) {
   if (skt) {
-    if (skt->base)
-      gpgsession_free(skt->base, skt->log_level);
-    if (skt->incoming)
-      gpgsession_free(skt->incoming, skt->log_level);
+    gpgsession_free(skt->base, skt->log_level);
+    gpgsession_free(skt->incoming, skt->log_level);
+    gpgsession_free(skt->fromfile, skt->log_level);
     if (skt->incomingkey.data) {
       free(skt->incomingkey.data);
     }
@@ -373,7 +371,7 @@ ssize_t skt_session_gpgme_write(void *h, const void *buf, size_t sz) {
 }
 
 void clearscreen(FILE* f) {
-  fprintf(f, "%s", ANSI_ESC "2J" ANSI_ESC "0;0H");
+  /*  fprintf(f, "%s", ANSI_ESC "2J" ANSI_ESC "0;0H"); */
   fflush(f);
 }
 
@@ -458,7 +456,7 @@ int skt_session_import_incoming_key(skt_st *skt, gpgme_key_t k) {
 /* FIXME: should be const, but gpgme is cranky */
 struct gpgme_data_cbs gpg_callbacks = { .write = skt_session_gpgme_write };
 
-int skt_session_send_key(skt_st *skt, gpgme_key_t key) {
+int skt_session_send_key(skt_st *skt, struct gpgsession *gpg, gpgme_key_t key) {
   int rc = 0;
   gpgme_error_t gerr = 0;
   gpgme_export_mode_t mode = GPGME_EXPORT_MODE_MINIMAL | GPGME_EXPORT_MODE_SECRET;
@@ -477,7 +475,7 @@ int skt_session_send_key(skt_st *skt, gpgme_key_t key) {
     return -1;
   }
   /* FIXME: blocking! */
-  if ((gerr = gpgme_op_export(skt->base->ctx, pattern, mode, data))) {
+  if ((gerr = gpgme_op_export(gpg->ctx, pattern, mode, data))) {
     free(pattern);
     fprintf(stderr, "failed to export key: (%d) %s\n", gerr, gpgme_strerror(gerr));
     return -1;
@@ -501,7 +499,10 @@ void ctrl_l(skt_st *skt) {
   if (skt->incoming) {
     gpgsession_display(skt->incoming, stdout);
   } else if (skt->handshake_done) {
-    gpgsession_display(skt->base, stdout);
+    if (skt->fromfile)
+      gpgsession_display(skt->fromfile, stdout);
+    else 
+      gpgsession_display(skt->base, stdout);
   } else {
     /* redisplay QR code */
     skt_session_show_qr(skt, stdout);
@@ -533,10 +534,13 @@ void input_read_cb(uv_stream_t* stream, ssize_t nread, const uv_buf_t* buf) {
           }
         }
       }
-    } else if (skt->handshake_done && gpgsession_can_handle_keypress(skt->base, c)) {
-      struct gpgkey *k = gpgsession_fetch_key(skt->base, c);
-      if (k)
-        skt_session_send_key(skt, k->key);
+    } else if (skt->handshake_done) {
+      struct gpgsession * gpg = skt->fromfile ? skt->fromfile : skt->base;
+      if (gpgsession_can_handle_keypress(gpg, c)) {
+        struct gpgkey *k = gpgsession_fetch_key(gpg, c);
+        if (k)
+          skt_session_send_key(skt, gpg, k->key);
+      }
     } else {
       if (skt->log_level > 2)
         fprintf(stderr, "Got %d (0x%02x) '%.1s'\n", buf->base[0], buf->base[0], isprint(buf->base[0])? buf->base : "_");
@@ -977,23 +981,23 @@ void skt_session_handshake_done(skt_st *skt) {
   fprintf(stdout, "TLS handshake complete: %s\n", desc);
   gnutls_free(desc);
   skt->handshake_done = true;
-  gpgsession_display(skt->base, stdout);
+  ctrl_l(skt);
 }
 
-int skt_session_gather_secret_keys(skt_st *skt) {
+int gpgsession_gather_secret_keys(struct gpgsession *gpg) {
   gpgme_error_t gerr;
   int secret_only = 1;
   const char *pattern = NULL;
   fprintf(stdout, "Gathering a list of available OpenPGP secret keys...\n");
-  if ((gerr = gpgme_op_keylist_start(skt->base->ctx, pattern, secret_only))) {
+  if ((gerr = gpgme_op_keylist_start(gpg->ctx, pattern, secret_only))) {
     fprintf(stderr, "Failed to start gathering keys: (%d) %s\n", gerr, gpgme_strerror(gerr));
     return 1;
   }
   while (!gerr) {
     gpgme_key_t key = NULL;
-    gerr = gpgme_op_keylist_next(skt->base->ctx, &key);
+    gerr = gpgme_op_keylist_next(gpg->ctx, &key);
     if (!gerr) {
-      if (gpgsession_add_key(skt->base, key))
+      if (gpgsession_add_key(gpg, key))
         goto fail;
     } else if (gpgme_err_code(gerr) != GPG_ERR_EOF) {
       fprintf(stderr, "Failed to get keys: (%d) %s\n", gerr, gpgme_strerror(gerr));
@@ -1002,7 +1006,7 @@ int skt_session_gather_secret_keys(skt_st *skt) {
   }
   return 0;
  fail:
-  if ((gerr = gpgme_op_keylist_end(skt->base->ctx)))
+  if ((gerr = gpgme_op_keylist_end(gpg->ctx)))
     fprintf(stderr, "failed to gpgme_op_keylist_end(): (%d) %s\n", gerr, gpgme_strerror(gerr));
   return 1;
 }
@@ -1394,7 +1398,7 @@ int main(int argc, const char *argv[]) {
   int rc;
   gnutls_psk_server_credentials_t creds = NULL;
   gnutls_priority_t priority_cache;
-  FILE * inkey = NULL;
+  int inkeysfd = -1;
   const char *ll;
   int log_level;
 
@@ -1409,17 +1413,13 @@ int main(int argc, const char *argv[]) {
   }
 
   if (argc > 1) {
-    if (!strcmp(argv[1], "-")) {
-      inkey = stdin;
-    } else {
-      inkey = fopen(argv[1], "r");
-      if (inkey == NULL)
-        fprintf(stderr, "could not read key '%s', instead waiting to receive key: (%d) %s\n",
-                argv[1], errno, strerror(errno));
-    }
+    inkeysfd = open(argv[1], 0, O_RDONLY);
+    if (inkeysfd == -1)
+      fprintf(stderr, "could not read key '%s', falling back to normal GnuPG: (%d) %s\n",
+              argv[1], errno, strerror(errno));
   }
-
   skt = skt_session_new(&loop, log_level);
+
   if (!skt) {
     fprintf(stderr, "Failed to initialize skt object\n");
     return -1;
@@ -1427,8 +1427,34 @@ int main(int argc, const char *argv[]) {
   if (skt_session_choose_address(skt))
     return -1;
 
-  if (skt_session_gather_secret_keys(skt))
-    return -1;
+  if (inkeysfd != -1) {
+    gpgme_error_t gerr;
+    gpgme_data_t d = NULL;
+    if ((gerr = gpgme_data_new_from_fd(&d, inkeysfd))) {
+      fprintf(stderr, "failed to initialize new gpgme data. (%d) %s\n",
+              gerr, gpgme_strerror(gerr));
+      return -1;
+    }
+    skt->fromfile = gpgsession_new(true, '1', argv[1], gpgsession_instructions_base);
+    if (skt->fromfile) {
+      /* FIXME: blocking */
+      gerr = gpgme_op_import(skt->fromfile->ctx, d);
+      gpgme_data_release(d);
+      if (gerr) {
+        fprintf(stderr, "Failed to import key(s) from file '%s', falling back to normal GnuPG: (%d) %s\n", argv[1], gerr, gpgme_strerror(gerr));
+        gpgsession_free(skt->fromfile, skt->log_level);
+        skt->fromfile = NULL;
+      } else if (gpgsession_gather_secret_keys(skt->fromfile)) {
+        fprintf(stderr, "Failed to learn the secret key(s) available in %s\n", argv[1]);
+        gpgsession_free(skt->fromfile, skt->log_level);
+        skt->fromfile = NULL;
+      }
+    }
+  }
+
+  if (!skt->fromfile)
+    if (gpgsession_gather_secret_keys(skt->base))
+      return -1;
   
   /* open tls server connection */
   if ((rc = gnutls_init(&skt->session, GNUTLS_SERVER | GNUTLS_NONBLOCK))) {
@@ -1490,39 +1516,6 @@ int main(int argc, const char *argv[]) {
     }
   }
 
-  if (inkey) {
-    /* FIXME: send key */
-    char data[65536];
-    if (skt->log_level > 3)
-      fprintf(stderr, "trying to write %s to client\n", (stdin == inkey) ? "standard input" : argv[1]);
-
-    /* read from inkey, send to gnutls */
-    while (!feof(inkey)) {
-      size_t r;
-      r = fread(data, 1, sizeof(data), inkey); /* FIXME: blocking */
-      if (ferror(inkey)) {
-        fprintf(stderr, "Error reading from input\n");
-        return -1;
-      } else {
-        if (skt->log_level > 3)
-          fprintf(stderr, "trying to write %zd octets to client\n", r);
-        while (r) {
-          rc = GNUTLS_E_AGAIN;
-          while (rc == GNUTLS_E_AGAIN || rc == GNUTLS_E_INTERRUPTED) {
-            rc = gnutls_record_send(skt->session, data, r); /* FIXME: blocking */
-            if (rc < 0) {
-              if (rc != GNUTLS_E_AGAIN && rc != GNUTLS_E_INTERRUPTED) {
-                fprintf(stderr, "gnutls_record_send() failed: (%d) %s\n", rc, gnutls_strerror(rc));
-                return -1;
-              }
-            } else {
-              r -= rc;
-            }
-          }
-        }
-      }
-    }
-  }
 
   /* cleanup */
   skt_session_free(skt);
