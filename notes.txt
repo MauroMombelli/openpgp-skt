@@ -20,4 +20,20 @@ gnutls_bye got error (-10) The specified session has been invalidated for some r
 uv_loop_close() returned (-16) resource busy or locked
 
  * display multiple User IDs, creation time in key listing
+ 
  * display revocation status in key listing?
+
+ * manpage
+ 
+ * in passive mode, track status of which secret keys have been imported
+ 
+ * when user tries to offer keys from a file, never offer keys from
+   the base gpg homedir, even on error
+
+ * debian packaging
+ 
+ * README.md, LICENSE.txt
+
+ * include spec?
+
+
