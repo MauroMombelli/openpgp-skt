@@ -1375,7 +1375,6 @@ int skt_session_show_qr(skt_st *skt, FILE *f) {
   }
   fprintf(f, "%s\n", urlbuf);
       
-  /* generate qrcode (FIXME: can't use QR_MODE_AN, because QRcode_encodeString only likes 8bit or kanji; need to invoke this differently) */
   qrinput = QRinput_new();
   if (!qrinput) {
     fprintf(stderr, "Failed to allocate new QRinput\n");
