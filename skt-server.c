@@ -1039,7 +1039,8 @@ void gpgsession_display(struct gpgsession *session, FILE *f) {
   int numleft = session->num_keys - session->keylist_offset;
   if (numleft > KEYS_PER_PAGE)
     numleft = KEYS_PER_PAGE;
-
+  clearscreen(f);
+  
   session->instructions(session, f);
   
   if (session->num_keys) {
