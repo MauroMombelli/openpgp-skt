@@ -6,6 +6,7 @@ https://pad.stratum0.org/p/openpgp-skt
 TODO:
  * allow selection of IP address (and network interface)
 
- * improve visual effects for UI (e.g. clear the terminal before/after)
-
  * add zbarcam-style client work.
+
+ * allow loading keys for export from a file, instead of from the
+   default GNUPGHOME.
