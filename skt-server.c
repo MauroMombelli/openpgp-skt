@@ -64,14 +64,14 @@ struct gpgsession {
   char base_key;
   const char *name;
 
-  /* what functions can happen?
-   * display
-   * respond to keypress */
+  void (*instructions)(struct gpgsession *session, FILE *f);
 };
 
 void gpgsession_free(struct gpgsession *session, int log_level);
-struct gpgsession * gpgsession_new(bool ephemeral, char base_key, const char *name);
+struct gpgsession * gpgsession_new(bool ephemeral, char base_key, const char *name, void (*instructions)(struct gpgsession *session, FILE *f));
 void gpgsession_display(struct gpgsession *session, FILE *f);
+void gpgsession_instructions_base(struct gpgsession *session, FILE *f);
+void gpgsession_instructions_incoming(struct gpgsession *session, FILE *f);
 
 struct skt_session {
   uv_loop_t *loop;
@@ -228,7 +228,7 @@ int gpgsession_add_fpr(struct gpgsession *session, const char *fpr) {
   return 0;
 }
 
-struct gpgsession * gpgsession_new(bool ephemeral, char base_key, const char *name) {
+struct gpgsession * gpgsession_new(bool ephemeral, char base_key, const char *name, void (*instructions)(struct gpgsession *session, FILE *f)) {
   struct gpgsession *ret;
   gpgme_error_t gerr;
   int rc;
@@ -289,6 +289,7 @@ struct gpgsession * gpgsession_new(bool ephemeral, char base_key, const char *na
 
   ret->base_key = base_key;
   ret->name = name;
+  ret->instructions = instructions;
   return ret;
  fail:
   if (xdgf)
@@ -561,7 +562,7 @@ skt_st * skt_session_new(uv_loop_t *loop, int log_level) {
     if (skt->iwcfgfd < 0) /* non-fatal error */
       fprintf(stderr, "Warning: unable to learn about wireless configuration\n"); 
 
-    skt->base = gpgsession_new(false, '1', "base");
+    skt->base = gpgsession_new(false, '1', "base", gpgsession_instructions_base);
     if (!skt->base) {
       fprintf(stderr, "failed to prepare base GnuPG session\n");
       goto fail;
@@ -1019,24 +1020,29 @@ int skt_session_gather_secret_keys(skt_st *skt) {
   return 1;
 }
 
+void gpgsession_instructions_base(struct gpgsession *session, FILE *f) {
+  if (!session->num_keys)
+    fprintf(f, "You have no secret keys that you can send.\n");
+  fprintf(f, "To receive a key, ask the other device to send it.\n");
+  if (session->num_keys)
+    fprintf(f, "To send a key, press its number:\n\n");
+}
 
+void gpgsession_instructions_incoming(struct gpgsession *session, FILE *f) {
+  if (!session->num_keys)
+    fprintf(f, "The other device has started sending keys, but no valid keys have arrived yet.\n");
+  else
+    fprintf(f, "To import an incoming key, press its letter: \n\n");
+}
 
 void gpgsession_display(struct gpgsession *session, FILE *f) {
   int numleft = session->num_keys - session->keylist_offset;
   if (numleft > KEYS_PER_PAGE)
     numleft = KEYS_PER_PAGE;
 
-  if (!strcmp(session->name, "base")) { /* FIXME: yuck! parameterize this */
-    if (!session->num_keys)
-      fprintf(f, "You have no secret keys that you can send.\n");
-    fprintf(f, "To receive a key, ask the other device to send it.\n");
-  } else if (!strcmp(session->name, "incoming")) {
-    if (!session->num_keys)
-      fprintf(f, "The other device has started sending keys, but no valid keys have arrived yet.\n");
-  }
+  session->instructions(session, f);
   
   if (session->num_keys) {
-    fprintf(f, "To send a key, press its number:\n\n");
     for (int ix = 0; ix < numleft; ix++) {
       fprintf(f, "[%c] %s\n    %s\n", session->base_key + ix,
               session->keys[session->keylist_offset + ix].key->uids->uid,
@@ -1276,7 +1282,7 @@ void skt_session_read_cb(uv_stream_t* stream, ssize_t nread, const uv_buf_t* buf
 
       /* we're now in passive mode.  */
       if (!skt->incoming) {
-        skt->incoming = gpgsession_new(true, 'a', "incoming");
+        skt->incoming = gpgsession_new(true, 'a', "incoming", gpgsession_instructions_incoming);
         if (!skt->incoming) {
           its_all_over(skt, "failed to prepare for key input\n");
           return;
