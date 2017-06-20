@@ -54,6 +54,7 @@ void skt_session_cleanup_listener(uv_handle_t* handle);
 int skt_session_import_incoming_key(skt_st *skt, gpgme_key_t k);
 int recursive_unlink(const char *pathname, int log_level);
 void clearscreen(FILE *f);
+int skt_session_show_qr(skt_st *skt, FILE *f);
 
 
 struct gpgsession {
@@ -497,7 +498,14 @@ void ctrl_d(skt_st *skt) {
 
 
 void ctrl_l(skt_st *skt) {
-  /* FIXME: refresh the screen */
+  if (skt->incoming) {
+    gpgsession_display(skt->incoming, stdout);
+  } else if (skt->handshake_done) {
+    gpgsession_display(skt->base, stdout);
+  } else {
+    /* redisplay QR code */
+    skt_session_show_qr(skt, stdout);
+  }
 }
 
 void quit(skt_st *skt) {
@@ -1339,6 +1347,66 @@ void skt_session_connect(uv_stream_t* server, int x) {
   }
 }
 
+int skt_session_show_qr(skt_st *skt, FILE *f) {
+  char urlbuf[INET6_ADDRSTRLEN + 1024];
+  int urllen;
+  QRinput *qrinput = NULL;
+  QRcode *qrcode = NULL;
+  int rc;
+  
+  clearscreen(f);
+  
+  /* construct string */
+  urlbuf[sizeof(urlbuf)-1] = 0;
+  urllen = snprintf(urlbuf, sizeof(urlbuf)-1, "%s:%s/%d/%s%s%s",
+                    schema,
+                    skt->addrp,
+                    skt->port,
+                    skt->pskhex,
+                    skt->essid ? "/SSID:" : "",
+                    skt->essid ? skt->essid : "");
+  if (urllen >= (sizeof(urlbuf)-1)) {
+    fprintf(stderr, "buffer was somehow truncated.\n");
+    goto fail;
+  }
+  if (urllen < 5) {
+    fprintf(stderr, "printed URL was somehow way too small (%d).\n", urllen);
+    goto fail;
+  }
+  fprintf(f, "%s\n", urlbuf);
+      
+  /* generate qrcode (FIXME: can't use QR_MODE_AN, because QRcode_encodeString only likes 8bit or kanji; need to invoke this differently) */
+  qrinput = QRinput_new();
+  if (!qrinput) {
+    fprintf(stderr, "Failed to allocate new QRinput\n");
+    goto fail;
+  }
+  if ((rc = QRinput_append(qrinput, QR_MODE_AN, strlen(urlbuf), (unsigned char *)urlbuf))) {
+    fprintf(stderr, "failed to QRinput_append: (%d) %s\n", rc == -1 ? errno: rc, strerror(rc == -1 ? errno : rc));
+    goto fail;
+  }
+  qrcode = QRcode_encodeInput(qrinput);
+  if (qrcode == NULL) {
+    fprintf(stderr, "failed to encode string as QRcode: (%d) %s\n", errno, strerror(errno));
+    goto fail;
+  }
+  
+  /* display qrcode */
+  if ((rc = print_qrcode(f, qrcode))) {
+    fprintf(stderr, "failed to print qr code\n");
+    goto fail;
+  }
+
+  QRcode_free(qrcode);
+  QRinput_free(qrinput);
+  return 0;
+ fail:
+  if (qrcode)
+    QRcode_free(qrcode);
+  if (qrinput)
+    QRinput_free(qrinput);
+  return -1;
+}
 
 
 
@@ -1348,10 +1416,6 @@ int main(int argc, const char *argv[]) {
   int rc;
   gnutls_psk_server_credentials_t creds = NULL;
   gnutls_priority_t priority_cache;
-  char urlbuf[INET6_ADDRSTRLEN + 1024];
-  int urllen;
-  QRinput *qrinput = NULL;
-  QRcode *qrcode = NULL;
   FILE * inkey = NULL;
   const char *ll;
   int log_level;
@@ -1422,49 +1486,9 @@ int main(int argc, const char *argv[]) {
     return -1;
   }
 
-  clearscreen(stdout);
+  if (skt_session_show_qr(skt, stdout))
+    return -1;
   
-  /* construct string */
-  urlbuf[sizeof(urlbuf)-1] = 0;
-  urllen = snprintf(urlbuf, sizeof(urlbuf)-1, "%s:%s/%d/%s%s%s",
-                    schema,
-                    skt->addrp,
-                    skt->port,
-                    skt->pskhex,
-                    skt->essid ? "/SSID:" : "",
-                    skt->essid ? skt->essid : "");
-  if (urllen >= (sizeof(urlbuf)-1)) {
-    fprintf(stderr, "buffer was somehow truncated.\n");
-    return -1;
-  }
-  if (urllen < 5) {
-    fprintf(stderr, "printed URL was somehow way too small (%d).\n", urllen);
-    return -1;
-  }
-  fprintf(stdout, "%s\n", urlbuf);
-      
-  /* generate qrcode (FIXME: can't use QR_MODE_AN, because QRcode_encodeString only likes 8bit or kanji; need to invoke this differently) */
-  qrinput = QRinput_new();
-  if (!qrinput) {
-    fprintf(stderr, "Failed to allocate new QRinput\n");
-    return -1;
-  }
-  if ((rc = QRinput_append(qrinput, QR_MODE_AN, strlen(urlbuf), (unsigned char *)urlbuf))) {
-    fprintf(stderr, "failed to QRinput_append: (%d) %s\n", rc == -1 ? errno: rc, strerror(rc == -1 ? errno : rc));
-    return -1;
-  }
-  qrcode = QRcode_encodeInput(qrinput);
-  if (qrcode == NULL) {
-    fprintf(stderr, "failed to encode string as QRcode: (%d) %s\n", errno, strerror(errno));
-    return -1;
-  }
-  
-  /* display qrcode */
-  if ((rc = print_qrcode(stdout, qrcode))) {
-    fprintf(stderr, "failed to print qr code\n");
-    return -1;
-  }
-
   /* FIXME: should flush all input before starting to respond to it? */
   if ((rc = uv_tty_init(skt->loop, &skt->input, 0, 1))) {
     fprintf(stderr, "failed to grab stdin for reading, using passive mode only: (%d) %s\n", rc, uv_strerror(rc));
@@ -1527,8 +1551,6 @@ int main(int argc, const char *argv[]) {
   skt_session_free(skt);
   gnutls_priority_deinit(priority_cache);
   gnutls_psk_free_server_credentials(creds);
-  QRcode_free(qrcode);
-  QRinput_free(qrinput);
   if ((rc = uv_loop_close(&loop)))
     fprintf(stderr, "uv_loop_close() returned (%d) %s\n", rc, uv_strerror(rc));
   return 0;
