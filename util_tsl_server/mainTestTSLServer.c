@@ -4,6 +4,7 @@
 #include <stdlib.h>
 
 #include <unistd.h>
+#include <stdint.h>
 
 #define PORT 5556               /* listen to 5556 port */
 
@@ -29,20 +30,39 @@ int main(void) {
 	create_and_print_qr(urlbuf, stdout);
 	
 	server_bind(PORT);
-	
-	while ( server_accept() == 1 ){ //while waiting for client
+	int client_id;
+	while ( (client_id = server_accept() ) == -1 ){ //while waiting for client
 		//wait for connection, ugly but hey, is a test
 		sleep(1);
 	}
 	
+	printf("out of accept\n");
+	
+	#define size 1000
+	uint8_t buffer[size];
+	int readed;
+	while ( (readed = client_read(client_id, buffer, size)) >= 0){
+		if (readed == 0){
+			printf("read nothing");
+		}else{
+			printf("readed: %d byte", readed);
+		}
+		sleep(1);
+	}
+	
+	printf("out of read\n");
+	
+	client_close(client_id);
+	printf("client closed\n");
+	
 	//while ( 1 ){ //while waiting for client
 		//wait for connection, ugly but hey, is a test
-		server_handshake();
-		sleep(10);
+		
 	//}
 	
 	
 	server_close();
+	printf("server closed\n");
 	/*
 	 * 
 	 * int err, listen_sd;

@@ -5,7 +5,6 @@
 #endif
 
 #include <stdio.h>
-#include <stdlib.h>
 #include <errno.h>
 #include <sys/types.h>
 #include <sys/socket.h>
@@ -146,58 +145,35 @@ int server_bind(const int port) {
 	return 0;
 }
 
-int client_close(const int i) {
-	gnutls_bye(clients[i].session, GNUTLS_SHUT_RDWR);
-	
-	close(clients[i].socket_id);
-	gnutls_deinit(clients[i].session);
-	
-	clients[i].status = CLOSED;
-	
-	return 0;
-}
-
-int client_read(const int i, void * const buffer, const size_t size){
-	int ret = gnutls_record_recv(clients[i].session, buffer, size);
-	
-	if (ret == 0) {
-		printf ("\n- Peer has closed the GnuTLS connection\n");
-		client_close(i);
-		return -1;
-	} else if (ret < 0 && gnutls_error_is_fatal(ret) == 0) { 
-		fprintf(stderr, "*** Warning: %s\n", gnutls_strerror(ret));
-	} else if (ret < 0) {
-		fprintf(stderr, "\n*** Received corrupted data(%d). Closing the connection.\n\n", ret);
-		return -1;
-	} else if (ret > 0) {
-		/* echo data back to the client */
-		gnutls_record_send(clients[i].session, buffer, ret);
-	}
-	
-	return 0;
-}
-
 int server_handshake() {
 	for(unsigned int i = 0; i < MAX_CLIENTS; i++) {
 		if (clients[i].status != HANDSHAKE){
 			continue;
 		}
 		
-		
+		printf("client hadshake happening: %d\n", i);
 		int ret = gnutls_handshake(clients[i].session);
 		
-		if (ret < 0 && gnutls_error_is_fatal(ret) != 0) {
-			close( clients[i].socket_id );
-			gnutls_deinit(clients[i].session);
-			fprintf(stderr, "*** Handshake has failed (%s)\n\n", gnutls_strerror(ret));
-			clients[i].status = CLOSED;
-			continue;
+		switch(ret) {
+			case GNUTLS_E_WARNING_ALERT_RECEIVED:
+				;
+				gnutls_alert_description_t alert;
+				alert = gnutls_alert_get(clients[i].session);
+				fprintf(stderr, "Got GnuTLS alert (%d) %s\n", alert, gnutls_alert_get_name(alert));
+				break;
+			case GNUTLS_E_INTERRUPTED:
+			case GNUTLS_E_AGAIN:
+				fprintf(stderr, "gnutls_handshake() got (%d) %s\n", ret, gnutls_strerror(ret));
+				break;
+			case GNUTLS_E_SUCCESS:
+				clients[i].status = OPEN;
+				return i;
+			default:
+				close( clients[i].socket_id );
+				gnutls_deinit(clients[i].session);
+				fprintf(stderr, "*** Handshake has failed (%s)\n\n", gnutls_strerror(ret));
+				clients[i].status = CLOSED;
 		}
-		if (ret){
-			printf("- Handshake was completed\n");
-			clients[i].status = OPEN;
-			return i;
-		}		
 	}
 	
 	return -1;
@@ -208,11 +184,11 @@ int server_accept() {
 	struct sockaddr_storage sa_cli;
 	socklen_t client_len;
 	
-	int sd = accept(listen_sd, (struct sockaddr *) &sa_cli, &client_len); /*SOCK_NONBLOCK*/
+	int sd = accept4(listen_sd, (struct sockaddr *) &sa_cli, &client_len, SOCK_NONBLOCK); /*SOCK_NONBLOCK*/
 	
 	if (sd < 1) {
 		//fprintf(stderr, "failed accept any client %d\n", sd);
-		return 1;
+		return server_handshake();
 	}
 	
 	printf("client connected\n");
@@ -269,5 +245,40 @@ int server_accept() {
 	
 	clients[client_index].status = HANDSHAKE;
 	
+	return server_handshake();
+}
+
+int client_close(const int i) {
+	gnutls_bye(clients[i].session, GNUTLS_SHUT_RDWR);
+	
+	close(clients[i].socket_id);
+	gnutls_deinit(clients[i].session);
+	
+	clients[i].status = CLOSED;
+	
 	return 0;
+}
+
+int client_read(const int i, void * const buffer, const size_t size) {
+	printf ("\n- Start read\n");
+	int ret = gnutls_record_recv(clients[i].session, buffer, size);
+	printf ("\n- END read\n");
+	if (ret == GNUTLS_E_AGAIN){
+		printf ("\n- Peer did not sent data\n");
+		return 0;
+	}else if (ret == 0) {
+		printf ("\n- Peer has closed the GnuTLS connection\n");
+		client_close(i);
+		return -1;
+	} else if (ret < 0 && gnutls_error_is_fatal(ret) == 0) { 
+		fprintf(stderr, "*** Warning: %s\n", gnutls_strerror(ret));
+	} else if (ret < 0) {
+		fprintf(stderr, "\n*** Received corrupted data(%d). Closing the connection.\n\n", ret);
+		return -1;
+	} else if (ret > 0) {
+		/* echo data back to the client */
+		//gnutls_record_send(clients[i].session, buffer, ret);
+	}
+	
+	return ret;
 }
