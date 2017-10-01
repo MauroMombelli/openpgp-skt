@@ -249,6 +249,10 @@ int server_accept() {
 }
 
 int client_close(const int i) {
+	if (clients[i].status != OPEN) {
+		return -1;
+	}
+	
 	gnutls_bye(clients[i].session, GNUTLS_SHUT_RDWR);
 	
 	close(clients[i].socket_id);
