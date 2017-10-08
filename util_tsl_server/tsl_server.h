@@ -10,6 +10,7 @@ int server_accept();
 
 int server_close() ;
 
-int client_close(const int i);
+int client_close(const int fd) ;
 
-int client_read(const int i, void * const buffer, const size_t size);
+int client_update(const int fd, void * const buffer, const size_t size);
+

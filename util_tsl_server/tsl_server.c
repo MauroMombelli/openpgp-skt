@@ -21,7 +21,7 @@
  */
 
 
-#define SOCKET_ERR(err,s) if(err==-1) {perror(s);return(1);}
+#define SOCKET_ERR(err,s) if(err==-1) {perror(s);return(-1);}
 #define MAX_BUF 1024
 
 #define MAX_CLIENTS 1
@@ -38,11 +38,10 @@ struct session_tsl{
 	gnutls_session_t session;
 	gnutls_priority_t priority_cache;
 	enum connection_status status;
-	int socket_id;
 };
 
 gnutls_psk_server_credentials_t creds = NULL;
-struct session_tsl clients[MAX_CLIENTS] = {0};
+struct session_tsl * clients[FD_SETSIZE] = {0};
 
 int listen_sd;
 
@@ -124,7 +123,7 @@ int server_bind(const int port) {
 	 * Socket operations
 	 */
 	listen_sd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
-	SOCKET_ERR(listen_sd, "socket");
+	SOCKET_ERR(listen_sd, "socket_server_creation");
 	
 	struct sockaddr_in sa_serv;
 	memset(&sa_serv, '\0', sizeof(sa_serv));
@@ -136,87 +135,113 @@ int server_bind(const int port) {
 	setsockopt(listen_sd, SOL_SOCKET, SO_REUSEADDR, (void *) &optval, sizeof(int));
 	int err;
 	err = bind(listen_sd, (struct sockaddr *) &sa_serv, sizeof(sa_serv));
-	SOCKET_ERR(err, "bind");
-	err = listen(listen_sd, 1024);
-	SOCKET_ERR(err, "listen");
+	SOCKET_ERR(err, "socket_server_bind");
+	err = listen(listen_sd, 5);
+	SOCKET_ERR(err, "socket_server_listen");
 	
 	printf("Server ready. Listening to port '%d'.\n\n", port);
 
-	return 0;
+	return listen_sd;
 }
 
-int server_handshake() {
-	for(unsigned int i = 0; i < MAX_CLIENTS; i++) {
-		if (clients[i].status != HANDSHAKE){
-			continue;
-		}
-		
-		printf("client hadshake happening: %d\n", i);
-		int ret = gnutls_handshake(clients[i].session);
-		
-		switch(ret) {
-			case GNUTLS_E_WARNING_ALERT_RECEIVED:
-				;
-				gnutls_alert_description_t alert;
-				alert = gnutls_alert_get(clients[i].session);
-				fprintf(stderr, "Got GnuTLS alert (%d) %s\n", alert, gnutls_alert_get_name(alert));
-				break;
-			case GNUTLS_E_INTERRUPTED:
-			case GNUTLS_E_AGAIN:
-				fprintf(stderr, "gnutls_handshake() got (%d) %s\n", ret, gnutls_strerror(ret));
-				break;
-			case GNUTLS_E_SUCCESS:
-				clients[i].status = OPEN;
-				return i;
-			default:
-				close( clients[i].socket_id );
-				gnutls_deinit(clients[i].session);
-				fprintf(stderr, "*** Handshake has failed (%s)\n\n", gnutls_strerror(ret));
-				clients[i].status = CLOSED;
-		}
+int client_handshake(int fd) {
+	printf("client hadshake happening: %d\n", fd);
+	int ret = gnutls_handshake(clients[fd]->session);
+	
+	switch(ret) {
+		case GNUTLS_E_WARNING_ALERT_RECEIVED:
+			;
+			gnutls_alert_description_t alert;
+			alert = gnutls_alert_get(clients[fd]->session);
+			fprintf(stderr, "Got GnuTLS alert (%d) %s\n", alert, gnutls_alert_get_name(alert));
+			return 0; //fail, but not fatal
+		case GNUTLS_E_INTERRUPTED:
+		case GNUTLS_E_AGAIN:
+			fprintf(stderr, "gnutls_handshake() got (%d) %s\n", ret, gnutls_strerror(ret));
+			return 0; //fail, but not fatal
+		case GNUTLS_E_SUCCESS:
+			clients[fd]->status = OPEN;
+			return 0; // success!
+		default:
+			close( fd );
+			gnutls_deinit(clients[fd]->session);
+			fprintf(stderr, "*** Handshake has failed (%s)\n\n", gnutls_strerror(ret));
+			clients[fd]->status = CLOSED;
+			return -1; //fail, fatal
+	}
+	fprintf(stderr, "No handshake completed\n");
+}
+
+int client_read(const int fd, void * const buffer, const size_t size) {
+	printf ("\n- Start read\n");
+	int ret = gnutls_record_recv(clients[fd]->session, buffer, size);
+	printf ("\n- END read\n");
+	if (ret == GNUTLS_E_AGAIN){
+		printf ("\n- Peer did not sent data\n");
+		return 0;
+	}else if (ret == 0) {
+		printf ("\n- Peer has closed the GnuTLS connection\n");
+		client_close(fd);
+		return -1;
+	} else if (ret < 0 && gnutls_error_is_fatal(ret) == 0) { 
+		fprintf(stderr, "*** Warning: %s\n", gnutls_strerror(ret));
+	} else if (ret < 0) {
+		fprintf(stderr, "\n*** Received corrupted data(%d). Closing the connection.\n\n", ret);
+		return -1;
+	} else if (ret > 0) {
+		/* echo data back to the client */
+		//gnutls_record_send(clients[i].session, buffer, ret);
 	}
 	
-	return -1;
+	return ret;
+}
+
+
+int client_update(const int fd, void * const buffer, const size_t size) {
+	
+	switch (clients[fd]->status) {
+		case HANDSHAKE:
+			return client_handshake(fd);
+		case OPEN:
+			return client_read(fd, buffer, size);
+		default:
+			client_close(fd);
+			return -1;
+	}
+	
 }
 
 int server_accept() {
 	
-	struct sockaddr_storage sa_cli;
-	socklen_t client_len;
+	struct sockaddr sa_cli;
+	socklen_t client_len = sizeof(sa_cli);
 	
-	int sd = accept4(listen_sd, (struct sockaddr *) &sa_cli, &client_len, SOCK_NONBLOCK); /*SOCK_NONBLOCK*/
+	int client_fd = accept4(listen_sd, (struct sockaddr *) &sa_cli, &client_len, SOCK_NONBLOCK); /*SOCK_NONBLOCK*/
 	
-	if (sd < 1) {
-		//fprintf(stderr, "failed accept any client %d\n", sd);
-		return server_handshake();
-	}
-	
-	printf("client connected\n");
-	
-	int client_index = -1;
-	
-	for(unsigned int i = 0; i < MAX_CLIENTS; i++) {
-		if (clients[i].status == CLOSED){
-			client_index = i;
-		}
-	}
-	
-	if (client_index == -1) {
-		fprintf(stderr, "too many client connected\n");
+	if (client_fd < 1) {
+		fprintf(stderr, "failed accept any client %d\n", client_fd);
+		perror("err");
 		return -1;
 	}
 	
-	clients[client_index].socket_id = sd;
+	if (clients[client_fd] == NULL) {
+		clients[client_fd] = malloc( sizeof(struct session_tsl) );
+		if (clients[client_fd] == 0){
+			perror("failed to accept client, out of RAM?");
+			return -1;
+		}
+	}
+	printf("client connected\n");
 	
 	/* open tls server connection */
 	int rc;
-	rc = gnutls_init(&(clients[client_index].session), GNUTLS_SERVER | GNUTLS_NONBLOCK);
+	rc = gnutls_init(&(clients[client_fd]->session), GNUTLS_SERVER | GNUTLS_NONBLOCK);
 	if (rc) {
 		fprintf(stderr, "failed to init session: (%d) %s\n", rc, gnutls_strerror(rc));
 		return -1;
 	}
 	gnutls_psk_set_server_credentials_function(creds, get_psk_creds);
-	rc = gnutls_credentials_set(clients[client_index].session, GNUTLS_CRD_PSK, creds);
+	rc = gnutls_credentials_set(clients[client_fd]->session, GNUTLS_CRD_PSK, creds);
 	if (rc) {
 		fprintf(stderr, "failed to assign PSK credentials to GnuTLS server: (%d) %s\n", rc, gnutls_strerror(rc));
 		return -1;
@@ -230,59 +255,32 @@ int server_accept() {
 	":-KX-ALL:+ECDHE-PSK:+DHE-PSK"
 	":-3DES-CBC:-CAMELLIA-128-CBC:-CAMELLIA-256-CBC";
 	
-	rc = gnutls_priority_init(&(clients[client_index].priority_cache), priority, NULL);
+	rc = gnutls_priority_init(&(clients[client_fd]->priority_cache), priority, NULL);
 	if (rc) {
 		fprintf(stderr, "failed to set up GnuTLS priority: (%d) %s\n", rc, gnutls_strerror(rc));
 		return -1;
 	}
-	rc = gnutls_priority_set(clients[client_index].session, clients[client_index].priority_cache);
+	rc = gnutls_priority_set(clients[client_fd]->session, clients[client_fd]->priority_cache);
 	if (rc) {
 		fprintf(stderr, "failed to assign gnutls priority: (%d) %s\n", rc, gnutls_strerror(rc));
 		return -1;
 	}
 	
-	gnutls_transport_set_int(clients[client_index].session, sd);
+	gnutls_transport_set_int(clients[client_fd]->session, client_fd);
 	
-	clients[client_index].status = HANDSHAKE;
+	clients[client_fd]->status = HANDSHAKE;
 	
-	return server_handshake();
+	return client_fd;
 }
 
-int client_close(const int i) {
-	if (clients[i].status != OPEN) {
-		return -1;
-	}
+int client_close(const int fd) {
 	
-	gnutls_bye(clients[i].session, GNUTLS_SHUT_RDWR);
+	gnutls_bye(clients[fd]->session, GNUTLS_SHUT_RDWR);
 	
-	close(clients[i].socket_id);
-	gnutls_deinit(clients[i].session);
+	close(fd);
+	gnutls_deinit(clients[fd]->session);
 	
-	clients[i].status = CLOSED;
+	clients[fd]->status = CLOSED;
 	
 	return 0;
-}
-
-int client_read(const int i, void * const buffer, const size_t size) {
-	printf ("\n- Start read\n");
-	int ret = gnutls_record_recv(clients[i].session, buffer, size);
-	printf ("\n- END read\n");
-	if (ret == GNUTLS_E_AGAIN){
-		printf ("\n- Peer did not sent data\n");
-		return 0;
-	}else if (ret == 0) {
-		printf ("\n- Peer has closed the GnuTLS connection\n");
-		client_close(i);
-		return -1;
-	} else if (ret < 0 && gnutls_error_is_fatal(ret) == 0) { 
-		fprintf(stderr, "*** Warning: %s\n", gnutls_strerror(ret));
-	} else if (ret < 0) {
-		fprintf(stderr, "\n*** Received corrupted data(%d). Closing the connection.\n\n", ret);
-		return -1;
-	} else if (ret > 0) {
-		/* echo data back to the client */
-		//gnutls_record_send(clients[i].session, buffer, ret);
-	}
-	
-	return ret;
 }
