@@ -1,10 +1,13 @@
 #include "util_qr/qr_code.h"
 #include "util_tsl_server/tsl_server.h"
+#include "util_network_info/network_info.h"
 
 #include <stdlib.h>
 
 #include <unistd.h>
 #include <stdint.h>
+
+#include <string.h>
 
 #define PORT 5556               /* listen to 5556 port */
 
@@ -15,13 +18,24 @@ void open_server() {
 	const char schema[] = "OPGPSKT";
 	urlbuf[sizeof(urlbuf)-1] = 0;
 	char addrp[] = "192.168.0.27";
-	char pskhex[PSK_BYTES*2 + 1];
-	char eesid[] = "6561737962656C6C2044534C2D324446383444";
+	char pskhex[PSK_BYTES*3 + 1];
+	
+	struct network_info info;
+	
+	
+	
+	
 	
 	server_create(pskhex);
 	
-	snprintf(urlbuf, sizeof(urlbuf)-1, "%s:%s/%d/%s%s%s", schema, addrp, PORT, pskhex, "/SSID:", eesid);
+	get_info(&info);
+	printf("%s - %s %ld %d %ld\n", info.ssid, info.ip, strlen(pskhex), PSK_BYTES, sizeof(pskhex));
+	
+	snprintf(urlbuf, sizeof(urlbuf)-1, "%s:%s/%d/%s%s%s", schema, addrp, PORT, pskhex, "/SSID:", info.ssid);
 	create_and_print_qr(urlbuf, stdout);
+	
+	free(info.ssid);
+	free(info.ip);
 	
 	server_fd = server_bind(PORT);
 }
