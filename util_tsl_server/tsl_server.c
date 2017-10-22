@@ -66,7 +66,7 @@ int get_psk_creds(gnutls_session_t session, const char* username, gnutls_datum_t
 	return 0;
 }
 
-int server_create(char * const pskhex) {
+int server_create(char * const pskhex, size_t pskhexsz) {
 	int rc;
 	
 	/* choose random number */  
@@ -75,7 +75,6 @@ int server_create(char * const pskhex) {
 		fprintf(stderr, "failed to get randomness: (%d) %s\n", rc, gnutls_strerror(rc));
 	}
 	
-	size_t pskhexsz;
 	if ((rc = gnutls_hex_encode(&psk, pskhex, &pskhexsz))) {
 		fprintf(stderr, "failed to encode PSK as a hex string: (%d) %s\n", rc, gnutls_strerror(rc));
 		return -1;
@@ -161,6 +160,7 @@ int client_handshake(int fd) {
 			return 0; //fail, but not fatal
 		case GNUTLS_E_SUCCESS:
 			clients[fd]->status = OPEN;
+			printf("client hadshake completed: %d\n\n", fd);
 			return 0; // success!
 		default:
 			close( fd );

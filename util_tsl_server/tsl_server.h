@@ -4,7 +4,7 @@
 
 int server_bind(const int port);
 
-int server_create(char * const pskhex);
+int server_create(char * const pskhex, size_t pskhexsz);
 
 int server_accept();
 

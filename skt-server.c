@@ -17,21 +17,16 @@ void open_server() {
 	char urlbuf[1024];
 	const char schema[] = "OPGPSKT";
 	urlbuf[sizeof(urlbuf)-1] = 0;
-	char addrp[] = "192.168.0.27";
-	char pskhex[PSK_BYTES*3 + 1];
+	char pskhex[PSK_BYTES*2 + 1];
 	
 	struct network_info info;
 	
-	
-	
-	
-	
-	server_create(pskhex);
+	server_create(pskhex, sizeof(pskhex));
 	
 	get_info(&info);
 	printf("%s - %s %ld %d %ld\n", info.ssid, info.ip, strlen(pskhex), PSK_BYTES, sizeof(pskhex));
 	
-	snprintf(urlbuf, sizeof(urlbuf)-1, "%s:%s/%d/%s%s%s", schema, addrp, PORT, pskhex, "/SSID:", info.ssid);
+	snprintf(urlbuf, sizeof(urlbuf)-1, "%s:%s/%d/%s%s%s", schema, info.ip, PORT, pskhex, "/SSID:", info.ssid);
 	create_and_print_qr(urlbuf, stdout);
 	
 	free(info.ssid);
@@ -50,20 +45,25 @@ void loop() {
 	int is_running = 1;
 	
 	while (is_running) {
-		printf("main loop\n");
+		printf("-------------\nLOOP\n");
 		/* Wait up to five seconds. */
 		tv.tv_sec = 5;
 		tv.tv_usec = 0;
 	
-		/* Watch stdin (fd 0) to see when it has input. */
+		/* Watch server to see when it has input. */
 		FD_ZERO(&rfds);
 		if (server_fd == -1) {
 			printf("Impossible to bind the server port\n");
 			exit(-1);
 		}
 		FD_SET(server_fd, &rfds);
+		
+		/* Watch stdin (fd 0) to see when it has input. */
 		FD_SET(STDIN_FILENO, &rfds);
+		
+		/* Watch client to see when it has input. */
 		if (client_fd != -1) {
+			printf("client listening\n");
 			//set back
 			FD_SET(client_fd, &rfds);
 		}
@@ -91,7 +91,6 @@ void loop() {
 			if (FD_ISSET(server_fd, &rfds)) {
 				//only one connection at time
 				if (client_fd != -1){
-					FD_CLR(client_fd, &rfds);
 					client_close(client_fd);
 					client_fd = -1;
 				}
@@ -106,19 +105,27 @@ void loop() {
 			if (client_fd != -1 && FD_ISSET(client_fd, &rfds)){
 				printf("client %d! ", client_fd);
 				uint8_t buff[100];
-				int ris = client_update( client_fd, buff, sizeof(buff) );
-				if (ris == -1) {
-					FD_CLR(client_fd, &rfds);
-					client_fd = -1;
-				}
+				int ris;
+				do{
+					ris = client_update( client_fd, buff, sizeof(buff) );
+					if (ris == -1) {
+						printf("client closed %d", client_fd);
+						client_close(client_fd);
+						client_fd = -1;
+					}else{
+						printf("client sent data %d byte: ", ris);
+						for (size_t i = 0; i < ris; i++)
+						{
+							printf("%02X", buff[i]);
+						}
+					}
+				}while(ris > 0);
 			}
-			
-			//listen for handshake
 			
 			
 			printf("\n");
 		}else{
-			printf("No data within five seconds.\n");
+			//printf("No data within five seconds.\n");
 		}
 	}
 }
