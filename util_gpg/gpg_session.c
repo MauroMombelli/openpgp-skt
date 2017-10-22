@@ -1,139 +1,123 @@
-#include "qr_code.h"
+#include "gpg_session.h"
 
-#include <qrencode.h>
+#include <string.h>
+
+#include <stdio.h>
 #include <errno.h>
-#include <string.h> //strerror
+#include <sys/types.h>
+#include <dirent.h>
+#include <unistd.h>
 
-int print_qrcode(FILE* f, const QRcode* qrcode) {
-	const struct { char *data; size_t size; }  out[] = {
-		{ .data = "\xe2\x96\x88", .size = 3 }, /* U+2588 FULL BLOCK */
-		{ .data = "\xe2\x96\x80", .size = 3 }, /* U+2580 UPPER HALF BLOCK */
-		{ .data = "\xe2\x96\x84", .size = 3 }, /* U+2584 LOWER HALF BLOCK */
-		{ .data = " ", .size = 1 }, /* U+0020 SPACE */
-	};
-	const int margin = 2;
-	int mx, my;
-	
-	if (1 != fwrite("\n", 1, 1, f)) {
-		fprintf(stderr, "failed to write start of qrcode\n");
-		return -1;
-	}
-	
-	for (my = 0; my < margin; my++) {
-		for (mx = 0; mx < qrcode->width + margin*4; mx++){
-			if (1 != fwrite(out[0].data, out[0].size, 1, f)) {
-				fprintf(stderr, "failed at upper margin of qrcode\n");
-				return -1;
-			}
-		}
-		if (1 != fwrite("\n", 1, 1, f)) {
-			fprintf(stderr, "failed writing newline into QR code in upper margin\n");
-			return -1;
-		}
-	}
-	
-	for (int iy = 0; iy < qrcode->width; iy+= 2) {
-		for (mx = 0; mx < margin*2; mx++)
-			if (1 != fwrite(out[0].data, out[0].size, 1, f)) {
-				fprintf(stderr, "failed at left margin of qrcode in row %d\n", iy);
-				return -1;
-			}
-		for (int ix = 0; ix < qrcode->width; ix++) {
-			int n = (qrcode->data[iy*qrcode->width + ix] & 0x01) << 1;
-			if (iy+1 < qrcode->width)
-				n += (qrcode->data[(iy+1)*qrcode->width + ix] & 0x01);
-			if (1 != fwrite(out[n].data, out[n].size, 1, f)) {
-				fprintf(stderr, "failed writing QR code at (%d,%d)\n", ix, iy);
-				return -1;
-			}
-		}
-		for (mx = 0; mx < margin*2; mx++)
-			if (1 != fwrite(out[0].data, out[0].size, 1, f)) {
-				fprintf(stderr, "failed at right margin of qrcode in row %d\n", iy);
-				return -1;
-			}
-		if (1 != fwrite("\n", 1, 1, f)) {
-			fprintf(stderr, "failed writing newline into QR code after line %d\n", iy);
-			return -1;
-		}
-	}
-	
-	for (my = 0; my < margin; my++) {
-		for (mx = 0; mx < qrcode->width + margin*4; mx++)
-			if (1 != fwrite(out[0].data, out[0].size, 1, f)) {
-				fprintf(stderr, "failed at lower margin of qrcode\n");
-				return -1;
-			}
-		if (1 != fwrite("\n", 1, 1, f)) {
-			fprintf(stderr, "failed writing newline into QR code in lower margin\n");
-			return -1;
-		}
-	}
-	
-	if (fflush(f))
-		fprintf(stderr, "Warning: failed to flush QR code stream: (%d) %s\n", errno, strerror(errno));
-	
-	return 0;
-}
 
-int create_qr(const char * const string, QRcode **qrcode) {
+void gpgsession_new(gpgme_ctx_t *ctx, bool ephemeral) {
+	printf("gpgsession_new\n");
+	gpgme_error_t gerr;
 	
-	QRinput *qrinput = NULL;
 	int rc;
+	char *xdg = NULL;
+	bool xdgf = false;
 	
-	if (*qrcode != NULL) {
-		fprintf(stderr, "QRcode expected to be NULL\n");
-		return -1;
+	char *ephemeral_path = NULL;
+	
+	// Initialization, required
+	gpgme_check_version(NULL);
+	gerr = gpgme_engine_check_version(GPGME_PROTOCOL_OpenPGP);
+	
+	if (gerr) {
+		fprintf(stderr, "gpgme_new failed when setting up ephemeral incoming directory: (%d), %s\n", gerr, gpgme_strerror(gerr));
+		return;
 	}
 	
-	fprintf(stdout, "%s\n", string);
 	
-	qrinput = QRinput_new();
-	if (!qrinput) {
-		fprintf(stderr, "Failed to allocate new QRinput\n");
+	
+	if (ephemeral) {
+		xdg = getenv("XDG_RUNTIME_DIR");
+		if (xdg == NULL) {
+			rc = asprintf(&xdg, "/run/user/%d", getuid());
+			if (rc == -1) {
+				fprintf(stderr, "failed to guess user ID during ephemeral GnuPG setup.\r\n");
+				goto fail;
+			}
+			xdgf = true;
+		}
+		
+		if (F_OK != access(xdg, W_OK)) {
+			fprintf(stderr, "We don't have write access to '%s' for GnuPG ephemeral dir, falling back...\n", xdg);
+			free(xdg);
+			xdgf = false;
+			xdg = getenv("TMPDIR");
+			if (xdg == NULL || (F_OK != access(xdg, W_OK))) {
+				if (xdg != NULL)
+					fprintf(stderr, "We don't have write access to $TMPDIR ('%s') for GnuPG ephemeral dir, falling back to /tmp\n", xdg);
+				xdg = "/tmp";
+			}
+		}
+		rc = asprintf(&ephemeral_path, "%s/skt-server.XXXXXX", xdg);
+		if (rc == -1) {
+			fprintf(stderr, "Failed to allocate ephemeral GnuPG directory name in %s\n", xdg);
+			goto fail;
+		}
+		if (NULL == mkdtemp(ephemeral_path)) {
+			fprintf(stderr, "failed to generate an ephemeral GnuPG homedir from template '%s'\n", ephemeral_path);
+			goto fail;
+		}
+	}
+	
+	if ((gerr = gpgme_new(ctx))) {
+		fprintf(stderr, "gpgme_new failed when setting up ephemeral incoming directory: (%d), %s\n",
+				gerr, gpgme_strerror(gerr));
 		goto fail;
 	}
-	if ((rc = QRinput_append(qrinput, QR_MODE_AN, strlen(string), (unsigned char *)string))) {
-		fprintf(stderr, "failed to QRinput_append: (%d) %s\n", rc == -1 ? errno: rc, strerror(rc == -1 ? errno : rc));
+	if ((gerr = gpgme_ctx_set_engine_info(*ctx, GPGME_PROTOCOL_OpenPGP, NULL, ephemeral_path))) {
+		fprintf(stderr, "gpgme_ctx_set_engine_info failed%s%s%s: (%d), %s\n",
+				ephemeral?" ephemeral (":"",
+				ephemeral?ephemeral_path:"",
+				ephemeral?")":"",
+		  gerr, gpgme_strerror(gerr));
 		goto fail;
 	}
-	*qrcode = QRcode_encodeInput(qrinput);
+	gpgme_set_armor(*ctx, 1);
+
+	free(ephemeral_path);
 	
-	QRinput_free(qrinput);
+	return;
 	
-	if (*qrcode == NULL) {
-		fprintf(stderr, "failed to encode string as QRcode: (%d) %s\n", errno, strerror(errno));
-		goto fail;
-	}
-	
-	return 0;
 	fail:
-	if (qrinput)
-		QRinput_free(qrinput);
-	return -1;
+	if (xdgf)
+		free(xdg);
+	if (ephemeral_path != NULL) {
+		if (rmdir(ephemeral_path)){
+			fprintf(stderr, "failed to rmdir('%s'): (%d) %s\n", ephemeral_path, errno, strerror(errno));
+		}
+		free(ephemeral_path);
+	}
 }
 
-int create_and_print_qr(const char * const string, FILE* f) {
-	
-	QRcode *qrcode = NULL;
-	
-	if ( create_qr(string, &qrcode) ) {
-		fprintf(stderr, "failed to create qr code\n");
-		goto fail;
+int gpgsession_gather_secret_keys(gpgme_ctx_t *ctx) {
+	printf("gpgsession_gather_secret_keys\n");
+	gpgme_error_t gerr;
+	int secret_only = 1;
+	const char *pattern = NULL;
+	fprintf(stdout, "Gathering a list of available OpenPGP secret keys...\n");
+	if ((gerr = gpgme_op_keylist_start(*ctx, pattern, secret_only))) {
+		fprintf(stderr, "Failed to start gathering keys: (%d) %s\n", gerr, gpgme_strerror(gerr));
+		return 1;
 	}
-	
-	/* display qrcode */
-	if ( print_qrcode(f, qrcode) ) {
-		fprintf(stderr, "failed to print qr code\n");
-		goto fail;
+	while (!gerr) {
+		gpgme_key_t key = NULL;
+		gerr = gpgme_op_keylist_next(*ctx, &key);
+		if (!gerr) {
+			//if (gpgsession_add_key(gpg, key))
+			//	goto fail;
+			printf("Got keys: %s - %s\n", key->uids->uid, key->fpr);
+		} else if (gpgme_err_code(gerr) != GPG_ERR_EOF) {
+			fprintf(stderr, "Failed to get keys: (%d) %s\n", gerr, gpgme_strerror(gerr));
+			goto fail;
+		}
 	}
-	
-	QRcode_free(qrcode);
-	
 	return 0;
-	
 	fail:
-	if (qrcode)
-		QRcode_free(qrcode);
-	return -1;
+	if ((gerr = gpgme_op_keylist_end(*ctx)))
+		fprintf(stderr, "failed to gpgme_op_keylist_end(): (%d) %s\n", gerr, gpgme_strerror(gerr));
+	return 1;
 }

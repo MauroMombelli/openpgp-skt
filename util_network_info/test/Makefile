@@ -9,8 +9,8 @@ LDFLAGS += -liw
 OBJECTS = testNetInfo
 all: testNetInfo
 
-testNetInfo: test/main.c network_info.c
-	gcc $(CFLAGS) $(LDFLAGS) -I. -std=c11 -pedantic -Wall -Werror -o $@ $^
+testNetInfo: main.c ../network_info.c
+	gcc $(CFLAGS) $(LDFLAGS) -I ../ -std=c11 -pedantic -Wall -Werror -o $@ $^
 
 clean:
 	rm -f $(OBJECTS)
