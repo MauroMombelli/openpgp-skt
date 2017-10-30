@@ -7,7 +7,7 @@
 //#include <net/if.h>
 #include "iwlib.h"
 
-#include "network_info.h"
+#include "util_network_info/network_info.h"
 
 int get_info(struct network_info * const info) {
 	/* pick an IP address with getifaddrs instead of using in6addr_any */
@@ -43,28 +43,35 @@ int get_info(struct network_info * const info) {
 		if (ifa->ifa_addr) {
 			family = ((struct sockaddr_storage*)(ifa->ifa_addr))->ss_family;
 			void * ptr = NULL;
-			if (family == AF_INET6)
+			
+			if (family == AF_INET6) {
 				ptr = &((struct sockaddr_in6*)(ifa->ifa_addr))->sin6_addr;
-			else if (family == AF_INET)
+			} else if (family == AF_INET) {
 				ptr = &((struct sockaddr_in*)(ifa->ifa_addr))->sin_addr;
-			else if (family == AF_PACKET) 
+			} else if (family == AF_PACKET) {
 				skip = true; /* struct rtnl_link_stats *stats = ifa->ifa_data */
-
-			if (!skip)
+			}
+			
+			if (!skip){
 				inet_ntop(family, ptr, addrstring, sizeof(addrstring));
-			else
+			} else {
 				strcpy(addrstring, "<unknown family>");
+			}
+			
 		} else {
 			strcpy(addrstring, "<no address>");
 		}
+		
 		if (ifa->ifa_flags & IFF_LOOPBACK) {
 			fprintf(stderr, "skipping %s because it is loopback\n", ifa->ifa_name);
 			continue;
 		}
+		
 		if (!(ifa->ifa_flags & IFF_UP)) {
 			fprintf(stderr, "skipping %s because it is not up\n", ifa->ifa_name);
 			continue;
 		}
+		
 		if (!skip) {
 			if (iwcfgfd >= 0) {
 				if (iw_get_basic_config(iwcfgfd, ifa->ifa_name, &cfg)) {

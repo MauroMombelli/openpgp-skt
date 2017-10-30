@@ -1,7 +1,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 
-#include "network_info.h"
+#include "util_network_info/network_info.h"
 
 int main(void) {
 	

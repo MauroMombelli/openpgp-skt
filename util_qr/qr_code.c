@@ -1,11 +1,11 @@
-#include "qr_code.h"
+#include "util_qr/qr_code.h"
 
 #include <qrencode.h>
 #include <errno.h>
 #include <string.h> //strerror
 
 int print_qrcode(FILE* f, const QRcode* qrcode) {
-	const struct { char *data; size_t size; }  out[] = {
+	static const struct { char *data; size_t size; }  out[] = {
 		{ .data = "\xe2\x96\x88", .size = 3 }, /* U+2588 FULL BLOCK */
 		{ .data = "\xe2\x96\x80", .size = 3 }, /* U+2580 UPPER HALF BLOCK */
 		{ .data = "\xe2\x96\x84", .size = 3 }, /* U+2584 LOWER HALF BLOCK */
@@ -19,6 +19,7 @@ int print_qrcode(FILE* f, const QRcode* qrcode) {
 		return -1;
 	}
 	
+	//TODO: find a pipeline friendly way to do that stuff
 	for (my = 0; my < margin; my++) {
 		for (mx = 0; mx < qrcode->width + margin*4; mx++){
 			if (1 != fwrite(out[0].data, out[0].size, 1, f)) {

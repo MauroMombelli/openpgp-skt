@@ -9,8 +9,8 @@ OBJECTS = testQr
 
 all: testQr
 
-testQr: mainTestQr.c qr_code.c
-	gcc $(CFLAGS) $(LDFLAGS) -std=c11 -pedantic -Wall -Werror -o $@ $^
+testQr: mainTestQr.c ../qr_code.c
+	gcc $(CFLAGS) $(LDFLAGS) -I ../../ -std=c11 -pedantic -Wall -Werror -o $@ $^
 
 clean:
 	rm -f $(OBJECTS)

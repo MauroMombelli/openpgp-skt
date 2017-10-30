@@ -10,7 +10,7 @@ OBJECTS = testNetInfo
 all: testNetInfo
 
 testNetInfo: main.c ../network_info.c
-	gcc $(CFLAGS) $(LDFLAGS) -I ../ -std=c11 -pedantic -Wall -Werror -o $@ $^
+	gcc $(CFLAGS) $(LDFLAGS) -I ../../ -std=c11 -pedantic -Wall -Werror -o $@ $^
 
 clean:
 	rm -f $(OBJECTS)

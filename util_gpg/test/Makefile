@@ -10,7 +10,7 @@ OBJECTS = testGgp
 all: testGpg
 
 testGpg: mainTestGpg.c ../gpg_session.c
-	gcc $(CFLAGS) $(LDFLAGS) -I ../ -std=c11 -pedantic -Wall -Werror -o $@ $^
+	gcc $(CFLAGS) $(LDFLAGS) -I ../../ -std=c11 -pedantic -Wall -Werror -o $@ $^
 
 clean:
 	rm -f $(OBJECTS)

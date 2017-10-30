@@ -41,14 +41,22 @@ int main(void) {
 	#define size 1000
 	uint8_t buffer[size];
 	int readed;
+	FILE *write_ptr;
+	
+	write_ptr = fopen("test.bin","wb");  // w for write, b for binary
+	
+	
 	while ( (readed = client_update(client_id, buffer, size)) >= 0){
 		if (readed == 0){
 			printf("read nothing");
 		}else{
 			printf("readed: %d byte", readed);
+			fwrite(buffer,readed,1,write_ptr); // write 10 bytes from our buffer
 		}
 		sleep(1);
 	}
+	
+	fclose(write_ptr);
 	
 	printf("out of read\n");
 	

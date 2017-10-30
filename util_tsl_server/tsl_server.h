@@ -1,3 +1,6 @@
+#ifndef TSL_SERVER_H
+#define TSL_SERVER_H
+
 #define PSK_BYTES 16
 
 #include <stdlib.h>
@@ -14,3 +17,4 @@ int client_close(const int fd) ;
 
 int client_update(const int fd, void * const buffer, const size_t size);
 
+#endif
