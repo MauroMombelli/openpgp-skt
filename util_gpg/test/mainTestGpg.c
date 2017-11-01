@@ -67,8 +67,12 @@ pmMuIRc8awRpS4UshjF1gzxuenZRfLio2P3ae5pH5tmzTuTD\n\
 \n";
 
 int main(int argc, const char *argv[]){
+	
 	gpgme_ctx_t ctx;
-	gpgsession_new(&ctx, false);
+	if (gpgsession_new(&ctx, false) != 0) {
+		fprintf(stderr, "failed to create gpg session\n");
+		return -1;
+	}
 	
 	int inkeysfd = -1;
 	if (argc > 1) {

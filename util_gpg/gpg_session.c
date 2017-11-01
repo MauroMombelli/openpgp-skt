@@ -10,7 +10,7 @@
 #include <stdint.h>
 
 
-void gpgsession_new(gpgme_ctx_t *ctx, bool ephemeral) {
+int gpgsession_new(gpgme_ctx_t *ctx, bool ephemeral) {
 	gpgme_error_t gerr;
 	
 	int rc;
@@ -19,16 +19,19 @@ void gpgsession_new(gpgme_ctx_t *ctx, bool ephemeral) {
 	
 	char *ephemeral_path = NULL;
 	
+	if (ctx != NULL) {
+		fprintf(stderr, "gpgme context must be null\n");
+		return -1;
+	}
+	
 	// Initialization, required
 	gpgme_check_version(NULL);
 	gerr = gpgme_engine_check_version(GPGME_PROTOCOL_OpenPGP);
 	
 	if (gerr) {
 		fprintf(stderr, "gpgme_new failed when setting up ephemeral incoming directory: (%d), %s\n", gerr, gpgme_strerror(gerr));
-		return;
+		return -1;
 	}
-	
-	
 	
 	if (ephemeral) {
 		xdg = getenv("XDG_RUNTIME_DIR");
@@ -80,7 +83,7 @@ void gpgsession_new(gpgme_ctx_t *ctx, bool ephemeral) {
 
 	free(ephemeral_path);
 	
-	return;
+	return 1;
 	
 	fail:
 	if (xdgf)
@@ -91,6 +94,7 @@ void gpgsession_new(gpgme_ctx_t *ctx, bool ephemeral) {
 		}
 		free(ephemeral_path);
 	}
+	return -1;
 }
 
 int gpgsession_free_secret_keys(gpgme_key_t ** const  list_result, const size_t list_len) {

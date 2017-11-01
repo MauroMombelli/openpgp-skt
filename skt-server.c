@@ -126,7 +126,10 @@ void loop() {
 	int is_running = 1;
 	
 	gpgme_ctx_t ctx;
-	gpgsession_new(&ctx, false);
+	if (gpgsession_new(&ctx, false) != 0) {
+		fprintf(stderr, "failed to generate gpg session\n");
+		return;
+	}
 	
 	while (is_running) {
 		/* Wait up to five seconds. */

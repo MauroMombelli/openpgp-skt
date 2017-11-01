@@ -57,6 +57,9 @@ int get_psk_creds(gnutls_session_t session, const char* username, gnutls_datum_t
 			return -1;
 		}
 	}
+	if (strcmp(username, psk_id_hint))  {
+		return -1;
+	}
 	
 	key->size = psk.size;
 	key->data = gnutls_malloc(psk.size);
@@ -117,7 +120,7 @@ int server_close() {
 	return 0;
 }
 
-int server_bind(const int port) {
+int server_bind(const uint16_t port) {
 	/*
 	 * Socket operations
 	 */
@@ -141,7 +144,11 @@ int server_bind(const int port) {
 	return listen_sd;
 }
 
-int client_handshake(int fd) {
+int client_handshake(const size_t fd) {
+	
+	if (clients[fd]->status != HANDSHAKE) {
+		return -1;
+	}
 	int ret = gnutls_handshake(clients[fd]->session);
 	
 	switch(ret) {
@@ -161,14 +168,18 @@ int client_handshake(int fd) {
 		default:
 			close( fd );
 			gnutls_deinit(clients[fd]->session);
-			fprintf(stderr, "*** Handshake has failed (%s)\n\n", gnutls_strerror(ret));
 			clients[fd]->status = CLOSED;
+			fprintf(stderr, "*** Handshake has failed (%s)\n\n", gnutls_strerror(ret));
 			return -1; //fail, fatal
 	}
 	fprintf(stderr, "No handshake completed\n");
 }
 
-int client_read(const int fd, void * const buffer, const size_t size) {
+int client_read(const size_t fd, void * const buffer, const size_t size) {
+	if (clients[fd]->status != OPEN) {
+		return -1;
+	}
+	
 	int ret = gnutls_record_recv(clients[fd]->session, buffer, size);
 	if (ret == GNUTLS_E_AGAIN){
 		return 0;
@@ -189,12 +200,15 @@ int client_read(const int fd, void * const buffer, const size_t size) {
 	return ret;
 }
 
-int client_write(const int fd, const void * const data, const size_t len) {
-	return gnutls_record_send(clients[fd]->session, data, len); /* FIXME: blocking */
+int client_write(const size_t fd, const void * const data, const size_t len) {
+	if (clients[fd]->status == OPEN) {
+		return gnutls_record_send(clients[fd]->session, data, len); /* FIXME: blocking */
+	}
+	return -1;
 }
 
 
-int client_update(const int fd, void * const buffer, const size_t size) {
+int client_update(const size_t fd, void * const buffer, const size_t size) {
 	
 	switch (clients[fd]->status) {
 		case HANDSHAKE:
@@ -208,7 +222,7 @@ int client_update(const int fd, void * const buffer, const size_t size) {
 	
 }
 
-int server_accept() {
+int server_accept(void) {
 	
 	struct sockaddr sa_cli;
 	socklen_t client_len = sizeof(sa_cli);
@@ -269,14 +283,15 @@ int server_accept() {
 	return client_fd;
 }
 
-int client_close(const int fd) {
+int client_close(const size_t fd) {
 	
-	gnutls_bye(clients[fd]->session, GNUTLS_SHUT_RDWR);
-	
-	close(fd);
-	gnutls_deinit(clients[fd]->session);
-	
-	clients[fd]->status = CLOSED;
-	
+	if (clients[fd]->status != CLOSED) {
+		gnutls_bye(clients[fd]->session, GNUTLS_SHUT_RDWR);
+		
+		close(fd);
+		gnutls_deinit(clients[fd]->session);
+		
+		clients[fd]->status = CLOSED;
+	}
 	return 0;
 }

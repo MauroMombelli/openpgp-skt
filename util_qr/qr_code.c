@@ -5,6 +5,8 @@
 #include <string.h> //strerror
 
 int print_qrcode(FILE* f, const QRcode* qrcode) {
+	//TODO: this function is very ugly and bad. Need rewrite
+	
 	static const struct { char *data; size_t size; }  out[] = {
 		{ .data = "\xe2\x96\x88", .size = 3 }, /* U+2588 FULL BLOCK */
 		{ .data = "\xe2\x96\x80", .size = 3 }, /* U+2580 UPPER HALF BLOCK */
@@ -13,6 +15,16 @@ int print_qrcode(FILE* f, const QRcode* qrcode) {
 	};
 	const int margin = 2;
 	int mx, my;
+	
+	if (f == NULL){
+		fprintf(stderr, "qrcode ouput handler invalid\n");
+		return -1;
+	}
+	
+	if (qrcode == NULL){
+		fprintf(stderr, "qrcode invalid\n");
+		return -1;
+	}
 	
 	if (1 != fwrite("\n", 1, 1, f)) {
 		fprintf(stderr, "failed to write start of qrcode\n");
@@ -87,7 +99,10 @@ int create_qr(const char * const string, QRcode **qrcode) {
 		return -1;
 	}
 	
-	fprintf(stdout, "%s\n", string);
+	if (string == NULL){
+		fprintf(stderr, "String should not be NULL\n");
+		return -1;
+	}
 	
 	qrinput = QRinput_new();
 	if (!qrinput) {
@@ -108,6 +123,7 @@ int create_qr(const char * const string, QRcode **qrcode) {
 	}
 	
 	return 0;
+	
 	fail:
 	if (qrinput)
 		QRinput_free(qrinput);

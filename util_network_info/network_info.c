@@ -9,9 +9,11 @@
 
 #include "util_network_info/network_info.h"
 
+
 int get_info(struct network_info * const info) {
-	/* pick an IP address with getifaddrs instead of using in6addr_any */
+	//TODO: this function is very ugly and bad. Need rewrite
 	
+	/* pick an IP address with getifaddrs instead of using in6addr_any */
 	struct ifaddrs *ifap, *ifa;
 	
 	if (getifaddrs(&ifap)) {
