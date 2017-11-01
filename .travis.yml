@@ -11,7 +11,7 @@ compiler:
 
 before_install:
   - sudo apt-get -qq update
-  - sudo apt-get install -y gnupg2 libqrencode-dev
+  - sudo apt-get install -y libgpgme-dev libqrencode-dev
 
 script:
   - make
