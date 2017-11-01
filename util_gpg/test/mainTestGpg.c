@@ -7,49 +7,7 @@
 #include <stdint.h>
 #include <stddef.h>
 
-
-int main(int argc, const char *argv[]){
-	gpgme_ctx_t ctx;
-	gpgsession_new(&ctx, false);
-	
-	int inkeysfd = -1;
-	if (argc > 1) {
-		printf("argv1\n");
-		inkeysfd = open(argv[1], 0, O_RDONLY);
-		if (inkeysfd == -1)
-			fprintf(stderr, "could not read key '%s', falling back to normal GnuPG: (%d) %s\n", argv[1], errno, strerror(errno));
-	}
-	
-	if (inkeysfd != -1) {
-		gpgme_error_t err;
-		gpgme_data_t d = NULL;
-		err = gpgme_data_new_from_fd(&d, inkeysfd);
-		if (gpgme_err_code(err) != GPG_ERR_NO_ERROR) {
-			fprintf(stderr, "failed to initialize new gpgme data. (%d) %s\n", err, gpgme_strerror(err));
-			return -1;
-		}
-		printf("ok stream\n");
-		/* FIXME: blocking */
-		err = gpgme_op_import(ctx, d);
-		printf("done import\n");
-		gpgme_data_release(d);
-		if (gpgme_err_code(err) != GPG_ERR_NO_ERROR){
-			fprintf(stderr, "Failed to import key(s) from file '%s', falling back to normal GnuPG: (%d) %s\n", argv[1], err, gpgme_strerror(err));
-			//gpgsession_free(skt->fromfile, skt->log_level);
-		}/* else if (gpgsession_gather_secret_keys(skt->fromfile)) {
-			fprintf(stderr, "Failed to learn the secret key(s) available in %s\n", argv[1]);
-			//gpgsession_free(skt->fromfile, skt->log_level);
-		}*/
-	}
-	
-	
-	//skt_session_try_incoming_keys to find the begin of the key
-	
-	//skt_session_ingest_key for actual import in gpgme
-	
-	gpgsession_gather_secret_keys(&ctx);
-	
-	char data[]= "-----BEGIN PGP PRIVATE KEY BLOCK-----\n\
+char data[]= "-----BEGIN PGP PRIVATE KEY BLOCK-----\n\
 \n\
 lQOYBFnGZ4UBCAC5RlBdGhKuIiGELZ0tGCpySW6sLxDDBUxUKzizsWsibis3sxm5\n\
 KVS+MFjqcKWHGWF+J+9CLtqYms7VXRExt6en+wtgl8VhXm7Qix1Id7BlRyk6Ml0F\n\
@@ -107,9 +65,80 @@ pmMuIRc8awRpS4UshjF1gzxuenZRfLio2P3ae5pH5tmzTuTD\n\
 =uFxb\n\
 -----END PGP PRIVATE KEY BLOCK-----\n\
 \n";
-	printf("importing test private key\n\n");
+
+int main(int argc, const char *argv[]){
+	gpgme_ctx_t ctx;
+	gpgsession_new(&ctx, false);
+	
+	int inkeysfd = -1;
+	if (argc > 1) {
+		printf("argv1\n");
+		inkeysfd = open(argv[1], 0, O_RDONLY);
+		if (inkeysfd == -1)
+			fprintf(stderr, "could not read key '%s', falling back to normal GnuPG: (%d) %s\n", argv[1], errno, strerror(errno));
+	}
+	
+	if (inkeysfd != -1) {
+		gpgme_error_t err;
+		gpgme_data_t d = NULL;
+		err = gpgme_data_new_from_fd(&d, inkeysfd);
+		if (gpgme_err_code(err) != GPG_ERR_NO_ERROR) {
+			fprintf(stderr, "failed to initialize new gpgme data. (%d) %s\n", err, gpgme_strerror(err));
+			return -1;
+		}
+		printf("ok stream\n");
+		/* FIXME: blocking */
+		err = gpgme_op_import(ctx, d);
+		printf("done import\n");
+		gpgme_data_release(d);
+		if (gpgme_err_code(err) != GPG_ERR_NO_ERROR){
+			fprintf(stderr, "Failed to import key(s) from file '%s', falling back to normal GnuPG: (%d) %s\n", argv[1], err, gpgme_strerror(err));
+			//gpgsession_free(skt->fromfile, skt->log_level);
+		}/* else if (gpgsession_gather_secret_keys(skt->fromfile)) {
+			fprintf(stderr, "Failed to learn the secret key(s) available in %s\n", argv[1]);
+			//gpgsession_free(skt->fromfile, skt->log_level);
+		}*/
+	}
+	
+	
+	//skt_session_try_incoming_keys to find the begin of the key
+	
+	//skt_session_ingest_key for actual import in gpgme
+	
+	printf("Gathering a list of available OpenPGP secret keys...\n");
+	gpgme_key_t *list_of_keys = NULL;
+	size_t number_of_keys;
+	gpgsession_gather_secret_keys(&ctx, &list_of_keys, &number_of_keys);
+	
+	for (size_t c = 0; c < number_of_keys; c++) {
+		printf("key %s\n", list_of_keys[c]->fpr);
+	}
+	
+	gpgsession_free_secret_keys(&list_of_keys, number_of_keys);
+	
+	printf("importing test private key\n");
 	
 	gpgsession_add_data(&ctx, data, sizeof(data) );
 	
-	gpgsession_gather_secret_keys(&ctx);
+	gpgsession_gather_secret_keys(&ctx, &list_of_keys, &number_of_keys);
+	
+	if (list_of_keys == NULL){
+		fprintf(stderr, "Failed to import expected key\n");
+		return -1;
+	}
+	
+	bool found = 0;
+	for (size_t c = 0; c < number_of_keys; c++) {
+		printf("key %s\n", list_of_keys[c]->fpr);
+		found |= strcmp("643DCBB823321CAB1517715EDAD3B3B87F023329", list_of_keys[c]->fpr) == 0;
+	}
+	
+	gpgsession_free_secret_keys(&list_of_keys, number_of_keys);
+	
+	if (!found) {
+		fprintf(stderr, "Iimport key NOT found\n");
+		return -1;
+	}
+	
+	return 0;
 }

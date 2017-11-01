@@ -93,33 +93,80 @@ void gpgsession_new(gpgme_ctx_t *ctx, bool ephemeral) {
 	}
 }
 
-int gpgsession_gather_secret_keys(gpgme_ctx_t *ctx) {
+int gpgsession_free_secret_keys(gpgme_key_t ** const  list_result, const size_t list_len) {
+	for (size_t count = 0; count < list_len; count++){
+		gpgme_key_release((*list_result)[count]);
+	}
+	free(*list_result);
+	(*list_result) = NULL;
+	return 0;
+}
+
+int gpgsession_gather_secret_keys(gpgme_ctx_t *ctx, gpgme_key_t ** const  list_result, size_t * const list_len) {
 	gpgme_error_t gerr;
 	int secret_only = 1;
 	const char *pattern = NULL;
-	fprintf(stdout, "Gathering a list of available OpenPGP secret keys...\n");
 	if ((gerr = gpgme_op_keylist_start(*ctx, pattern, secret_only))) {
 		fprintf(stderr, "Failed to start gathering keys: (%d) %s\n", gerr, gpgme_strerror(gerr));
 		return 1;
 	}
+	
+	if (*list_result != NULL){
+		//the list must be empty and clean
+		fprintf(stderr, "The container for list of keys is not empty\n");
+		return 1;
+	}
+	
+	size_t size = 100;
+	*list_len = 0;
+	(*list_result) = malloc(sizeof(gpgme_key_t) * size);
+	
 	while (!gerr) {
-		gpgme_key_t key = NULL;
-		gerr = gpgme_op_keylist_next(*ctx, &key);
-		if (!gerr) {
-			//if (gpgsession_add_key(gpg, key))
-			//	goto fail;
-			printf("Got keys: %s - %s\n", key->uids->uid, key->fpr);
-		} else if (gpgme_err_code(gerr) != GPG_ERR_EOF) {
+		if (*list_len >= size){
+			size += 100;
+			gpgme_key_t * tmp;
+			tmp = realloc(*list_result, sizeof(gpgme_key_t) * size);
+			if (tmp == NULL){
+				fprintf(stderr, "Failed to allocate memory for key\n");
+				goto fail;
+			}
+			(*list_result) = tmp;
+		}
+		
+		gpgme_key_t ris;
+		gerr = gpgme_op_keylist_next(*ctx, &ris); //user will have to clean them up with gpgme_key_release (key);
+		(*list_result)[*list_len] = ris;
+		
+		if (gerr && gpgme_err_code(gerr) != GPG_ERR_EOF) {
 			fprintf(stderr, "Failed to get keys: (%d) %s\n", gerr, gpgme_strerror(gerr));
 			goto fail;
 		}
+		
+		if (!gerr){
+			(*list_len)++;
+		}
 	}
+	
 	if ((gerr = gpgme_op_keylist_end(*ctx)))
 		fprintf(stderr, "failed to gpgme_op_keylist_end(): (%d) %s\n", gerr, gpgme_strerror(gerr));
+	
+	gpgme_key_t * tmp;
+	tmp = realloc(*list_result, (*list_len) * sizeof(gpgme_key_t)); //free unused space
+	if (tmp == NULL){
+		fprintf(stderr, "Failed to allocate memory for key\n");
+		goto fail;
+	}
+	(*list_result) = tmp;
+	
+	
 	return 0;
+	
 	fail:
 	if ((gerr = gpgme_op_keylist_end(*ctx)))
 		fprintf(stderr, "failed to gpgme_op_keylist_end(): (%d) %s\n", gerr, gpgme_strerror(gerr));
+	
+	gpgsession_free_secret_keys(list_result, *list_len);
+	
 	return 1;
 }
 
@@ -147,7 +194,6 @@ int gpgsession_import_key(gpgme_ctx_t * const ctx, const char * const data, cons
 		fprintf(stderr, "something went wrong during import to GnuPG\n");
 		return EIO;
 	}
-	printf("Imported %d secret keys\n", result->secret_imported);
 	
 	return 0;
 }
@@ -162,6 +208,8 @@ int gpgsession_add_data(gpgme_ctx_t * const ctx, const char * const input, const
 	
 	static char pk[100000] = {"-----BEGIN PGP PRIVATE KEY BLOCK-----\n"};
 	static size_t pk_index = sizeof(beingString);
+	
+	int imported = 0;
 	
 	switch(status) {
 		case WAIT_BEGIN: //we look for the beingString
@@ -265,7 +313,7 @@ int gpgsession_add_data(gpgme_ctx_t * const ctx, const char * const input, const
 					match = 0;
 					return gpgsession_add_data(ctx, input+index, length); //check if the buffer contains valid start sequence from here
 				}else if (match == sizeof(endString)) {
-					gpgsession_import_key(ctx, pk, pk_index);
+					imported += !gpgsession_import_key(ctx, pk, pk_index); //we know we import one key at time..
 					match = 0;
 					status = WAIT_BEGIN; //we have a valid start line, move to next state
 				}else{
@@ -275,7 +323,7 @@ int gpgsession_add_data(gpgme_ctx_t * const ctx, const char * const input, const
 			break;
 	}
 	
-	return 0;
+	return imported;
 }
 
 

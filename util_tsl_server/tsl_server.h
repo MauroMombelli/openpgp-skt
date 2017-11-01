@@ -17,4 +17,7 @@ int client_close(const int fd) ;
 
 int client_update(const int fd, void * const buffer, const size_t size);
 
+int client_write(const int fd, const void * const data, const size_t len);
+
+
 #endif

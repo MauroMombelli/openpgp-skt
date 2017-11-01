@@ -137,14 +137,11 @@ int server_bind(const int port) {
 	SOCKET_ERR(err, "socket_server_bind");
 	err = listen(listen_sd, 5);
 	SOCKET_ERR(err, "socket_server_listen");
-	
-	printf("Server ready. Listening to port '%d'.\n\n", port);
 
 	return listen_sd;
 }
 
 int client_handshake(int fd) {
-	printf("client hadshake happening: %d\n", fd);
 	int ret = gnutls_handshake(clients[fd]->session);
 	
 	switch(ret) {
@@ -156,11 +153,10 @@ int client_handshake(int fd) {
 			return 0; //fail, but not fatal
 		case GNUTLS_E_INTERRUPTED:
 		case GNUTLS_E_AGAIN:
-			fprintf(stderr, "gnutls_handshake() got (%d) %s\n", ret, gnutls_strerror(ret));
+			//fprintf(stderr, "gnutls_handshake() got (%d) %s\n", ret, gnutls_strerror(ret));
 			return 0; //fail, but not fatal
 		case GNUTLS_E_SUCCESS:
 			clients[fd]->status = OPEN;
-			printf("client hadshake completed: %d\n\n", fd);
 			return 0; // success!
 		default:
 			close( fd );
@@ -173,14 +169,11 @@ int client_handshake(int fd) {
 }
 
 int client_read(const int fd, void * const buffer, const size_t size) {
-	printf ("\n- Start read\n");
 	int ret = gnutls_record_recv(clients[fd]->session, buffer, size);
-	printf ("\n- END read\n");
 	if (ret == GNUTLS_E_AGAIN){
-		printf ("\n- Peer did not sent data\n");
 		return 0;
 	}else if (ret == 0) {
-		printf ("\n- Peer has closed the GnuTLS connection\n");
+		//fprintf(stderr, "\n- Peer has unexpectly closed the GnuTLS connection\n");
 		client_close(fd);
 		return -1;
 	} else if (ret < 0 && gnutls_error_is_fatal(ret) == 0) { 
@@ -194,6 +187,10 @@ int client_read(const int fd, void * const buffer, const size_t size) {
 	}
 	
 	return ret;
+}
+
+int client_write(const int fd, const void * const data, const size_t len) {
+	return gnutls_record_send(clients[fd]->session, data, len); /* FIXME: blocking */
 }
 
 
@@ -231,7 +228,6 @@ int server_accept() {
 			return -1;
 		}
 	}
-	printf("client connected\n");
 	
 	/* open tls server connection */
 	int rc;
