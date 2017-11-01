@@ -9,5 +9,9 @@ compiler:
   - gcc
   - clang
 
+before_install:
+  - sudo apt-get -qq update
+  - sudo apt-get install -y libgpgme11-dev
+
 script:
   - make
