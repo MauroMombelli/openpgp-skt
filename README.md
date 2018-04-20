@@ -1,6 +1,6 @@
 # opengpg-skt
 
-This program is used to share PRIVATE key with OpenKeyChain.
+This program is used to share PRIVATE key with [OpenKeyChain](https://www.openkeychain.org/).
 
 Simply use OpenKeyChain to scan the displayed QRcode, and sleect the key to import/export
 
