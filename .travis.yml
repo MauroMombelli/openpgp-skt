@@ -11,7 +11,7 @@ compiler:
 
 install:
   - sudo apt-get -qq update
-  - sudo apt-get install -y libqrencode-dev libc6-dev libgpg-error-dev libgpgme11 libassuan0 libc6 libgpg-error0 libassuan-dev libgpgme-dev
+  - sudo apt-get install -y libqrencode-dev libc6-dev libgpg-error-dev libgpgme11 libassuan0 libc6 libgpg-error0 libassuan-dev libgpgme11-dev
 
 
 script:
