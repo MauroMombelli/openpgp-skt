@@ -1,12 +1,12 @@
 # opengpg-skt
 
-This program is used to share PRIVATE key with OpenKeyChain.
+This program is used to share PRIVATE key with [OpenKeychain](https://www.openkeychain.org/).
 
-Simply use OpenKeyChain to scan the displayed QRcode, and sleect the key to import/export
+Simply use OpenKeychain to scan the displayed QRcode, and sleect the key to import/export
 
-NOTE: OpenKeyChain work in a way that a session can be only Export or Import, while this program allow both Import and Export.
-If your keys does not get imported in OpenKeyChain, probably is because you have imported a key.
-Workaround: Close the session by selecting "done" on OpenKeyChain, and then inizialize a new session by scanning again the barcode.
+NOTE: OpenKeychain work in a way that a session can be only Export or Import, while this program allow both Import and Export.
+If your keys does not get imported in OpenKeychain, probably is because you have imported a key.
+Workaround: Close the session by selecting "done" on OpenKeychain, and then inizialize a new session by scanning again the barcode.
 
 ## LICENSE
 
