@@ -19,8 +19,8 @@ int gpgsession_new(gpgme_ctx_t *ctx, bool ephemeral) {
 	
 	char *ephemeral_path = NULL;
 	
-	if (ctx != NULL) {
-		fprintf(stderr, "gpgme context must be null\n");
+	if (ctx == NULL) {
+		fprintf(stderr, "gpgme context must be not null\n");
 		return -1;
 	}
 	
@@ -83,7 +83,7 @@ int gpgsession_new(gpgme_ctx_t *ctx, bool ephemeral) {
 
 	free(ephemeral_path);
 	
-	return 1;
+	return 0;
 	
 	fail:
 	if (xdgf)
