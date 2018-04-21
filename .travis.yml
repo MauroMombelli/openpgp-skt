@@ -9,5 +9,13 @@ compiler:
   - gcc
   - clang
 
+before_install:
+  - sudo apt-get -qq update
+  - sudo apt-get install -y libqrencode-dev libc6-dev libgpg-error-dev libgpgme11 libassuan0 libc6 libgpg-error0 libassuan-dev
+  - wget http://security.ubuntu.com/ubuntu/pool/main/g/gpgme1.0/libgpgme-dev_1.8.0-3ubuntu5_i386.deb
+  - sudo dpkg -i libgpgme-dev_1.8.0-3ubuntu5_i386.deb || true
+  - sudo apt-get -f install
+  - sudo dpkg -i libgpgme-dev_1.8.0-3ubuntu5_i386.deb
+
 script:
   - make
