@@ -7,7 +7,7 @@ jobs:
       - checkout
       - run:
           name: Dependecy
-          command: apt-get -qq update && apt-get install -y make gcc libgnutls-dev libiw-dev libqrencode-dev libgnutls-dev libc6-dev libgpg-error-dev libgpgme11 libassuan0 libc6 libgpg-error0 libassuan-dev libgpgme11-dev
+          command: apt-get -qq update && apt-get install -y make gcc libgnutls28-dev libiw-dev libqrencode-dev libgnutls-dev libc6-dev libgpg-error-dev libgpgme11 libassuan0 libc6 libgpg-error0 libassuan-dev libgpgme11-dev
       - run:
           name: Build
           command: make skt-server
