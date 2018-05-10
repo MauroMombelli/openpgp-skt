@@ -19,6 +19,8 @@ int gpgsession_new(gpgme_ctx_t *ctx, bool ephemeral) {
 	
 	char *ephemeral_path = NULL;
 	
+	gpgme_check_version ("1.7.0");
+	
 	if (ctx == NULL) {
 		fprintf(stderr, "gpgme context must be not null\n");
 		return -1;

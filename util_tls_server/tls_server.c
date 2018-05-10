@@ -1,4 +1,4 @@
-#include "util_tsl_server/tsl_server.h"
+#include "util_tls_server/tls_server.h"
 
 #ifdef HAVE_CONFIG_H
 #include <config.h>
@@ -34,14 +34,14 @@ enum connection_status{
 	OPEN
 };
 
-struct session_tsl{
+struct session_tls{
 	gnutls_session_t session;
 	gnutls_priority_t priority_cache;
 	enum connection_status status;
 };
 
 gnutls_psk_server_credentials_t creds = NULL;
-struct session_tsl * clients[FD_SETSIZE] = {0};
+struct session_tls * clients[FD_SETSIZE] = {0};
 
 int listen_sd;
 
@@ -236,7 +236,7 @@ int server_accept(void) {
 	}
 	
 	if (clients[client_fd] == NULL) {
-		clients[client_fd] = malloc( sizeof(struct session_tsl) );
+		clients[client_fd] = malloc( sizeof(struct session_tls) );
 		if (clients[client_fd] == 0){
 			perror("failed to accept client, out of RAM?");
 			return -1;

@@ -16,7 +16,7 @@ OBJECTS = skt-server
 
 all: skt-server
 
-skt-server: skt-server.c util_qr/*.c util_tsl_server/*.c util_network_info/*.c util_gpg/*.c
+skt-server: skt-server.c util_qr/*.c util_tls_server/*.c util_network_info/*.c util_gpg/*.c
 	gcc $(CFLAGS) $(LDFLAGS) -I . -std=c11 -pedantic -Wall -Werror -o $@ $^
 
 clean:
