@@ -1,4 +1,4 @@
-# opengpg-skt
+# openpgp-skt
 
 This program is used to share PRIVATE key with [OpenKeychain](https://www.openkeychain.org/).
 
