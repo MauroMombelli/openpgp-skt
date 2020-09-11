@@ -259,12 +259,12 @@ int server_accept(void) {
 	
 	const char priority[] = "NORMAL:-CTYPE-ALL"
 	":%SERVER_PRECEDENCE:%NO_TICKETS"
-	":-VERS-TLS1.0:-VERS-TLS1.1:-VERS-DTLS1.0:-VERS-DTLS1.2"
+	":-VERS-DTLS1.2"
 	":-CURVE-SECP224R1:-CURVE-SECP192R1"
 	":-SIGN-ALL"
 	":-KX-ALL:+ECDHE-PSK:+DHE-PSK"
 	":-3DES-CBC:-CAMELLIA-128-CBC:-CAMELLIA-256-CBC";
-	
+
 	rc = gnutls_priority_init(&(clients[client_fd]->priority_cache), priority, NULL);
 	if (rc) {
 		fprintf(stderr, "failed to set up GnuTLS priority: (%d) %s\n", rc, gnutls_strerror(rc));
