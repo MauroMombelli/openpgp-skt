@@ -1,20 +1,17 @@
-language: c
+version: 2
 
-dist: bionic
-
-os:
-  - linux
-  #- osx
-  #- windows
-
-compiler:
-  - gcc
-  - clang
-
-install:
-  - sudo apt-get -qq update
-  - sudo apt-get install -y libqrencode-dev libc6-dev libgpg-error-dev libgpgme11 libassuan0 libc6 libgpg-error0 libassuan-dev libgpgme11-dev
-
-
-script:
-  - make skt-server
+jobs:
+  build:
+    docker:
+      - image: "debian:stretch"
+    steps:
+      - checkout
+      - run:
+          name: Installing build compiler
+          command: 'apt-get update && apt-get install -y gcc g++'
+      - run:
+          name: Install dependency
+          command: 'apt-get install -y libqrencode-dev libc6-dev libgpg-error-dev libgpgme11 libassuan0 libc6 libgpg-error0 libassuan-dev libgpgme11-dev'
+      - run:
+          name: Build the program
+          command: 'make skt-server'
