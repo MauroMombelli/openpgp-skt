@@ -1,9 +1,11 @@
 language: c
 
+dist: bionic
+
 os:
   - linux
-  - osx
-  - windows
+  #- osx
+  #- windows
 
 compiler:
   - gcc
