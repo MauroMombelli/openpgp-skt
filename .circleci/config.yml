@@ -7,17 +7,17 @@ jobs:
     steps:
       - run: 
           name: Update the system
-          command: 'apt-get update -y'
+          command: 'sudo apt-get update -y'
       - run:
           name: Installing git
-          command: 'apt-get install git'
+          command: 'sudo apt-get install git'
       - checkout
       - run:
           name: Installing build compiler
-          command: 'apt-get install -y gcc g++'
+          command: 'sudo apt-get install -y gcc g++'
       - run:
           name: Install dependency
-          command: 'apt-get install -y libqrencode-dev libc6-dev libgpg-error-dev libgpgme11 libassuan0 libc6 libgpg-error0 libassuan-dev libgpgme11-dev'
+          command: 'sudo apt-get install -y libqrencode-dev libc6-dev libgpg-error-dev libgpgme11 libassuan0 libc6 libgpg-error0 libassuan-dev libgpgme11-dev'
       - run:
           name: Build the program
           command: 'make skt-server'
