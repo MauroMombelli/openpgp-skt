@@ -1,13 +1,23 @@
 version: 2
+
 jobs:
   build:
     docker:
-      - image: debian:stretch
+      - image: cimg/base:2020.01
     steps:
+      - run: 
+          name: Update the system
+          command: 'apt-get update -y'
+      - run:
+          name: Installing git
+          command: 'apt-get install git'
       - checkout
       - run:
-          name: Dependecy
-          command: apt-get -qq update && apt-get install -y make gcc libgnutls28-dev libiw-dev libqrencode-dev libc6-dev libgpg-error-dev libgpgme11 libassuan0 libc6 libgpg-error0 libassuan-dev libgpgme11-dev
+          name: Installing build compiler
+          command: 'apt-get install -y gcc g++'
       - run:
-          name: Build
-          command: make skt-server
+          name: Install dependency
+          command: 'apt-get install -y libqrencode-dev libc6-dev libgpg-error-dev libgpgme11 libassuan0 libc6 libgpg-error0 libassuan-dev libgpgme11-dev'
+      - run:
+          name: Build the program
+          command: 'make skt-server'
